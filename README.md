@@ -1,10 +1,10 @@
-# PortableLM ⚡
+# PortableLM
 
 **PortableLM** is a fully air-gapped, zero-dependency, plug-and-play local AI environment designed to run seamlessly from your **local hard drive** or a **portable USB/SSD**. It bypasses complex installations — natively executing large language models directly on your hardware with no internet required.
 
 With a unified architecture, you can initialize your AI models once and choose to keep them on your system or carry them with you across Windows, macOS, Linux, and Android.
 
-## 🚀 Core Features
+## Core Features
 
 * **Zero Dependency Setup:** Ships with portable Python and isolated engine binaries. No system permissions, registry edits, or package managers required.
 * **Cross-Platform:** Uses an intelligent `Shared` volume system — download your 5GB+ AI models *once*, and use them natively on Windows, macOS, Linux, and Android without duplication.
@@ -14,14 +14,14 @@ With a unified architecture, you can initialize your AI models once and choose t
 
 ---
 
-## 💻 System Requirements
+## System Requirements
 
 - **Storage:** USB 3.0+ flash drive or SSD with at least **8 GB** free (16 GB recommended).
 - **RAM:** At least **8 GB** for 2B/4B models, **16 GB** for 9B/12B models.
 
 ---
 
-## 📂 Folder Architecture
+## Folder Architecture
 
 ```text
 [PortableLM Drive]
@@ -38,7 +38,7 @@ With a unified architecture, you can initialize your AI models once and choose t
 
 ---
 
-## 🧠 AI Model Library
+## AI Model Library
 
 Curated installer for high-quality, locally operable models:
 
@@ -51,7 +51,7 @@ Curated installer for high-quality, locally operable models:
 
 ---
 
-## ⚙️ Quick Start
+## Quick Start
 
 ### Step 1: Initialize the Engine
 
@@ -60,9 +60,9 @@ Run the install script for your OS:
 | OS | Command |
 |---|---|
 | **Windows** | Double-click `Windows/install.bat` |
-| **macOS** | Open Terminal → drag `Mac/install.command` → Enter |
+| **macOS** | Open Terminal -> drag `Mac/install.command` -> Enter |
 | **Linux** | `bash Linux/install.sh` |
-| **Android** | Open Termux → `bash Android/install.sh` |
+| **Android** | Open Termux -> `bash Android/install.sh` |
 
 > **Note:** This just downloads the tiny ~50MB execution engine for your OS to the `Shared/bin` folder.
 
@@ -84,7 +84,7 @@ The engine spins up and your browser opens the locally-served Chat UI.
 
 ---
 
-## 🏠 Local Disk Installation
+## Local Disk Installation
 
 Works beautifully as a lightweight local AI setup too:
 
@@ -97,12 +97,12 @@ Running from an internal SSD is significantly faster than USB — near-instant m
 
 ---
 
-## 📱 Android (Termux)
+## Android (Termux)
 
 Run AI **directly on your phone** — no PC required.
 
 **Requirements:**
-- [Termux from F-Droid](https://f-droid.org/en/packages/com.termux/) (not Play Store)
+- Termux from F-Droid (not Play Store)
 - 6 GB+ RAM (8 GB+ recommended)
 - WiFi/data for initial setup only
 - ARM64 processor
@@ -129,7 +129,7 @@ bash Android/start.sh
 
 ---
 
-## 📱 LAN Mobile Access
+## LAN Mobile Access
 
 Use your PC's AI from your phone on the couch:
 
@@ -141,7 +141,7 @@ Use your PC's AI from your phone on the couch:
 
 ---
 
-## 🛠️ Troubleshooting
+## Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -151,7 +151,7 @@ Use your PC's AI from your phone on the couch:
 
 ---
 
-## 📄 License
+## License
 
 MIT
 
