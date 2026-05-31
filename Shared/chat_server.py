@@ -566,8 +566,15 @@ def _run_sd_generation(job_id, payload, output_path):
 
     proc = None
     try:
+        # Set LD_LIBRARY_PATH so the dynamic linker can find libstable-diffusion.so
+        # which lives alongside the sd-cli binary.
+        sd_dir = os.path.dirname(os.path.abspath(SD_BINARY))
+        env = os.environ.copy()
+        existing_ldpath = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = sd_dir + (":" + existing_ldpath if existing_ldpath else "")
+
         # Merge stdout+stderr so we catch progress regardless of which stream sd uses
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
         # Start a thread to parse combined output
         output_thread = threading.Thread(
             target=_parse_sd_output,
