@@ -2451,6 +2451,11 @@
             <div class="img-warn" id="img-warn" style="display:none;"></div>
 
             <div class="img-row">
+              <label>Image Model</label>
+              <select id="img-model"><option value="">Loading...</option></select>
+            </div>
+
+            <div class="img-row">
               <label>Prompt</label>
               <textarea id="img-prompt" placeholder="Describe the image you want to generate..."></textarea>
             </div>
@@ -2645,6 +2650,7 @@
       imgSeed: $('#img-seed'),
       imgSampler: $('#img-sampler'),
       imgGenBtn: $('#img-gen-btn'),
+      imgModelSel: $('#img-model'),
       imgStopOllama: $('#img-stop-ollama'),
       imgStartOllama: $('#img-start-ollama'),
       imgPreview: $('#img-preview'),
@@ -2829,6 +2835,25 @@
       }
 
       // ── Mode Switching ─────────────────────────────────────────
+      async function fetchImageModels() {
+        try {
+          const r = await fetch('/api/image-models');
+          const d = await r.json();
+          const models = d.models || [];
+          if (!D.imgModelSel) return;
+          if (models.length === 0) {
+            D.imgModelSel.innerHTML = '<option value="">No .safetensors found</option>';
+            return;
+          }
+          const current = D.imgModelSel.value;
+          D.imgModelSel.innerHTML = models.map(m =>
+            `<option value="${esc(m.file)}"${m.file === current ? ' selected' : ''}>${esc(m.name)}${m.size ? ' (' + esc(m.size) + ')' : ''}</option>`
+          ).join('');
+        } catch {
+          if (D.imgModelSel) D.imgModelSel.innerHTML = '<option value="">Unavailable</option>';
+        }
+      }
+
       function switchMode(mode) {
         S.mode = mode;
         D.tabChat.classList.toggle('act', mode === 'chat');
@@ -2839,6 +2864,7 @@
         if (D.inpArea) D.inpArea.style.display = mode === 'chat' ? 'block' : 'none';
         if (mode === 'image') {
           updateEngineStatus();
+          fetchImageModels();
         } else {
           // Reset image UI when leaving image mode
           D.imgProgress.style.display = 'none';
@@ -3002,6 +3028,7 @@
 
         const payload = {
           prompt,
+          model_file: D.imgModelSel ? D.imgModelSel.value : '',
           negative_prompt: D.imgNeg.value.trim(),
           steps: parseInt(D.imgSteps.value, 10) || 20,
           cfg_scale: parseFloat(D.imgCfg.value) || 7.0,

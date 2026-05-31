@@ -106,8 +106,24 @@ def _find_sd_binary():
     return None
 
 SD_BINARY = _find_sd_binary()
-SD_MODEL = os.path.join(SCRIPT_DIR, "models", "CyberRealistic_V3.3_FP16.safetensors")
-SD_ENABLED = SD_BINARY is not None and os.path.isfile(SD_MODEL)
+
+def _find_sd_models():
+    """Return a list of dicts for every .safetensors file found in the models folder."""
+    models_dir = os.path.join(SCRIPT_DIR, "models")
+    found = []
+    if os.path.isdir(models_dir):
+        for fname in sorted(os.listdir(models_dir)):
+            if fname.lower().endswith(".safetensors"):
+                found.append({
+                    "file": fname,
+                    "path": os.path.join(models_dir, fname),
+                    "name": os.path.splitext(fname)[0].replace("_", " ").replace("-", " "),
+                })
+    return found
+
+SD_MODELS = _find_sd_models()
+SD_MODEL = SD_MODELS[0]["path"] if SD_MODELS else None
+SD_ENABLED = SD_BINARY is not None and len(SD_MODELS) > 0
 
 def _test_sd_binary():
     """Test if the SD binary can actually execute (catches missing VC++ runtime on Windows)."""
@@ -510,9 +526,25 @@ def _run_sd_generation(job_id, payload, output_path):
     if not SD_BINARY or not os.path.isfile(SD_BINARY):
         _update_image_job(job_id, status="error", error="Stable Diffusion engine not found. Please run the installer.")
         return
-    if not os.path.isfile(SD_MODEL):
-        _update_image_job(job_id, status="error", error="Image model not found. Please run the installer to download CyberRealistic.")
-        return
+
+    # Resolve the model: use the file from the payload if provided, else fall back to first found.
+    models_dir = os.path.join(SCRIPT_DIR, "models")
+    requested_file = payload.get("model_file", "")
+    if requested_file:
+        # Sanitize: only allow a plain filename (no path components)
+        requested_file = os.path.basename(requested_file)
+        candidate = os.path.join(models_dir, requested_file)
+        if os.path.isfile(candidate) and candidate.lower().endswith(".safetensors"):
+            model_path = candidate
+        else:
+            _update_image_job(job_id, status="error", error=f"Image model '{requested_file}' not found in models folder.")
+            return
+    else:
+        available = _find_sd_models()
+        if not available:
+            _update_image_job(job_id, status="error", error="No .safetensors image model found. Place one in the models folder.")
+            return
+        model_path = available[0]["path"]
 
     prompt = payload.get("prompt", "").strip()
     if not prompt:
@@ -532,7 +564,7 @@ def _run_sd_generation(job_id, payload, output_path):
 
     cmd = [
         SD_BINARY,
-        "-m", SD_MODEL,
+        "-m", model_path,
         "-p", prompt,
         "-o", output_path,
         "--steps", str(steps),
@@ -1017,18 +1049,23 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
     # ── Image Generation API ───────────────────────────────────
     def _get_image_models(self):
-        """Return the available image generation model(s)."""
+        """Return all .safetensors models found in the models folder."""
+        current_models = _find_sd_models()
         models = []
-        if SD_ENABLED:
+        for m in current_models:
+            size_str = ""
+            try:
+                size_bytes = os.path.getsize(m["path"])
+                size_str = f"{size_bytes / 1073741824:.2f} GB"
+            except Exception:
+                pass
             models.append({
-                "name": "CyberRealistic v3.3 FP16",
-                "local": "cyberrealistic-local",
-                "file": "CyberRealistic_V3.3_FP16.safetensors",
-                "size": "1.99 GB",
-                "label": "UNCENSORED",
-                "badge": "SD 1.5 - CYBER REALISTIC",
+                "name": m["name"],
+                "file": m["file"],
+                "size": size_str,
             })
-        data = json.dumps({"models": models, "sd_enabled": SD_ENABLED})
+        sd_available = SD_BINARY is not None and len(models) > 0
+        data = json.dumps({"models": models, "sd_enabled": sd_available})
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self._cors_headers()
@@ -1038,11 +1075,12 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def _get_engine_status(self):
         """Return which engines are currently running."""
         ollama_up = _is_ollama_running()
+        current_models = _find_sd_models()
         data = json.dumps({
             "ollama": ollama_up,
-            "sd_enabled": SD_ENABLED,
+            "sd_enabled": SD_BINARY is not None and len(current_models) > 0,
             "sd_binary": bool(SD_BINARY),
-            "sd_model": bool(os.path.isfile(SD_MODEL)) if SD_MODEL else False,
+            "sd_model": len(current_models) > 0,
             "sd_healthy": _test_sd_binary(),
         })
         self.send_response(200)
