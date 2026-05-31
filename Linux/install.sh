@@ -503,18 +503,12 @@ echo -e "${YLW}[6/7] Downloading Ollama AI Engine (Linux)...${RST}"
 
 OLLAMA_BIN="$SHARED_BIN/ollama-linux"
 
-# Determine whether any chat model is being installed; Ollama is only needed for chat.
 HAVE_CHAT_MODEL=false
 { [ "${#SELECTED_NUMS[@]}" -gt 0 ] || $HAS_CUSTOM; } && HAVE_CHAT_MODEL=true
 
-if ! $HAVE_CHAT_MODEL; then
-    if [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
-        echo -e "${GRN}      Ollama already installed - keeping it.${RST}"
-    else
-        echo -e "${DGR}      No chat model selected - skipping Ollama engine download.${RST}"
-    fi
+# Ollama is always installed so users can point it at their own models.
 # Validate: must exist, be a real ELF binary, and > 10 MB
-elif [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
+if [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
     echo -e "${GRN}      Ollama already installed! Skipping...${RST}"
 else
     # Remove any stale/corrupted file

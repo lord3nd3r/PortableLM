@@ -480,14 +480,9 @@ ARCHIVE_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-da
 HAVE_CHAT_MODEL=false
 { [ "${#SELECTED_NUMS[@]}" -gt 0 ] || $HAS_CUSTOM; } && HAVE_CHAT_MODEL=true
 
-if ! $HAVE_CHAT_MODEL; then
-    if [ -f "$OLLAMA_BIN" ] && is_macho "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
-        echo -e "${GRN}      Ollama already installed - keeping it.${RST}"
-    else
-        echo -e "${DGR}      No chat model selected - skipping Ollama engine download.${RST}"
-    fi
+# Ollama is always installed so users can point it at their own models.
 # Validate: must exist, be a real Mach-O binary, and > 10 MB
-elif [ -f "$OLLAMA_BIN" ] && is_macho "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
+if [ -f "$OLLAMA_BIN" ] && is_macho "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
     echo -e "${GRN}      Ollama already installed! Skipping...${RST}"
 else
     rm -f "$OLLAMA_BIN"

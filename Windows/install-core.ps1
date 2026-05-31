@@ -559,14 +559,7 @@ Write-Host "      Saved model list to installed-models.txt" -ForegroundColor Dar
 Write-Host ""
 Write-Host "[6/7] Downloading Ollama AI Engine (Windows)..." -ForegroundColor Yellow
 
-if (-not $HaveChatModel) {
-    if (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe") {
-        Write-Host "      Ollama already installed - keeping it." -ForegroundColor Green
-    } else {
-        Write-Host "      No chat model selected - skipping Ollama engine download." -ForegroundColor DarkGray
-    }
-} else {
-
+# Ollama is always installed so users can point it at their own models.
 $OllamaURL  = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
 $OllamaDest = "$USB_Drive\Shared\bin\ollama-windows-amd64.zip"
 $TempOllamaDir = "$USB_Drive\Shared\bin\temp_ollama"
@@ -616,7 +609,6 @@ if (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe") {
         $downloadErrors += "Ollama Engine"
     }
 }
-} # end HaveChatModel block for Ollama
 
 # =================================================================
 # STEP 6b: Download Stable Diffusion Image Engine
