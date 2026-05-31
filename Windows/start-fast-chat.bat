@@ -69,36 +69,54 @@ if exist "%~dp0..\Shared\python\python.exe" (
 :: -------------------------------------------------------
 :PythonReady
 
-if not exist "%~dp0..\Shared\bin\ollama-windows.exe" (
-    echo.
-    echo ===================================================
-    echo  ERROR: Ollama Engine Not Found!
-    echo ===================================================
-    echo.
-    echo  It looks like the AI engine hasn't been set up yet.
-    echo  Please double-click "install.bat" in the Windows 
-    echo  folder first to safely download the components!
-    echo.
-    pause
-    exit
-)
-
 :: Check if Ollama is already running
 curl -s http://127.0.0.1:11434/api/tags >nul 2>&1
 if %errorlevel%==0 (
-    echo [OK] Ollama engine is already running!
+    echo [OK] Ollama is already running - using existing instance.
     goto :StartChat
 )
 
-echo Starting Ollama Engine...
-start /b "" "%~dp0..\Shared\bin\ollama-windows.exe" serve
+:: Try portable engine first
+if exist "%~dp0..\Shared\bin\ollama-windows.exe" (
+    echo Starting portable Ollama engine...
+    start /b "" "%~dp0..\Shared\bin\ollama-windows.exe" serve
+    echo Waiting for engine to initialize...
+    :WaitLoop
+    timeout /t 1 /nobreak >nul
+    curl -s http://127.0.0.1:11434/api/tags >nul 2>&1
+    if %errorlevel% neq 0 goto :WaitLoop
+    echo [OK] Engine is online!
+    goto :StartChat
+)
 
-echo Waiting for engine to initialize...
-:WaitLoop
-timeout /t 1 /nobreak >nul
-curl -s http://127.0.0.1:11434/api/tags >nul 2>&1
-if %errorlevel% neq 0 goto :WaitLoop
-echo [OK] Engine is online!
+:: Fall back to system Ollama
+where ollama >nul 2>&1
+if %errorlevel%==0 (
+    echo Portable engine not found - starting system Ollama...
+    start /b "" ollama serve
+    echo Waiting for engine to initialize...
+    :WaitLoopSys
+    timeout /t 1 /nobreak >nul
+    curl -s http://127.0.0.1:11434/api/tags >nul 2>&1
+    if %errorlevel% neq 0 goto :WaitLoopSys
+    echo [OK] System Ollama is online!
+    goto :StartChat
+)
+
+echo.
+echo ===================================================
+echo  ERROR: No Ollama engine found!
+echo ===================================================
+echo.
+echo  No Ollama engine is running and none was found on
+echo  this system. To fix this, either:
+echo    1. Run "install.bat" to download the portable
+echo       engine, OR
+echo    2. Install Ollama from https://ollama.com and
+echo       make sure it is running before starting.
+echo.
+pause
+exit
 
 :: -------------------------------------------------------
 :: Start Chat Server

@@ -135,11 +135,13 @@ foreach ($m in $ModelCatalog) {
 
 Write-Host ""
 Write-Host "  [C] CUSTOM - Enter your own HuggingFace GGUF URL" -ForegroundColor Green
+Write-Host "  [S] SKIP   - Don't download a chat model (image generation only)" -ForegroundColor Green
 Write-Host ""
 Write-Host "  ------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Enter number(s) separated by commas  (e.g. 1,3)" -ForegroundColor Gray
 Write-Host "  Type 'all' for every preset model" -ForegroundColor Gray
 Write-Host "  Type 'c' to add a custom model" -ForegroundColor Gray
+Write-Host "  Type 's' to skip the chat model entirely" -ForegroundColor Gray
 Write-Host "  Mix them!  (e.g. 1,3,c)" -ForegroundColor Gray
 Write-Host ""
 
@@ -156,16 +158,23 @@ if ([string]::IsNullOrWhiteSpace($UserChoice)) {
 # -----------------------------------------------------------------
 $SelectedModels = @()
 $HasCustom = $false
+$SkipChatModel = $false
 
-# Check for 'all'
+# Check for 'all' or 'skip'
 if ($UserChoice.Trim().ToLower() -eq "all") {
     $SelectedModels = @($ModelCatalog)
+} elseif ($UserChoice.Trim().ToLower() -eq "s" -or $UserChoice.Trim().ToLower() -eq "skip" -or $UserChoice.Trim().ToLower() -eq "none") {
+    $SkipChatModel = $true
+    Write-Host ""
+    Write-Host "  Skipping chat model - installing image generation only." -ForegroundColor Yellow
 } else {
     $tokens = $UserChoice -split ","
     foreach ($token in $tokens) {
         $t = $token.Trim().ToLower()
         if ($t -eq "c" -or $t -eq "custom") {
             $HasCustom = $true
+        } elseif ($t -eq "s" -or $t -eq "skip" -or $t -eq "none") {
+            $SkipChatModel = $true
         } elseif ($t -match '^\d+$') {
             $num = [int]$t
             $found = $ModelCatalog | Where-Object { $_.Num -eq $num }
@@ -246,10 +255,11 @@ if ($HasCustom) {
 # -----------------------------------------------------------------
 # Validate we have at least one model
 # -----------------------------------------------------------------
-if ($SelectedModels.Count -eq 0) {
+if ($SelectedModels.Count -eq 0 -and -not $SkipChatModel) {
     Write-Host ""
     Write-Host "  ERROR: No models selected!" -ForegroundColor Red
     Write-Host "  Please run the installer again and pick at least one model." -ForegroundColor Red
+    Write-Host "  (Or type 's' to skip the chat model and install image generation only.)" -ForegroundColor Red
     Write-Host ""
     Write-Host "Press any key to exit..." -ForegroundColor Yellow
     $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
@@ -293,10 +303,14 @@ if ($SelectedModels.Count -ge 3 -or $UserChoice.Trim().ToLower() -eq "all") {
 # Show selection summary
 # -----------------------------------------------------------------
 Write-Host ""
-Write-Host "  Selected $($SelectedModels.Count) model(s):" -ForegroundColor Green
-foreach ($m in $SelectedModels) {
-    $sizeInfo = if ($m.Size -ne "?") { " (~$($m.Size) GB)" } else { "" }
-    Write-Host "    + $($m.Name)$sizeInfo" -ForegroundColor White
+if ($SkipChatModel -and $SelectedModels.Count -eq 0) {
+    Write-Host "  No chat model selected (image generation only)." -ForegroundColor Yellow
+} else {
+    Write-Host "  Selected $($SelectedModels.Count) model(s):" -ForegroundColor Green
+    foreach ($m in $SelectedModels) {
+        $sizeInfo = if ($m.Size -ne "?") { " (~$($m.Size) GB)" } else { "" }
+        Write-Host "    + $($m.Name)$sizeInfo" -ForegroundColor White
+    }
 }
 Write-Host ""
 
@@ -498,11 +512,17 @@ foreach ($m in $SelectedModels) {
     }
 }
 
+$HaveChatModel = ($SelectedModels.Count -gt 0)
+
 # =================================================================
 # STEP 5: Create Modelfile configuration for each model
 # =================================================================
 Write-Host ""
 Write-Host "[5/7] Creating AI model configurations..." -ForegroundColor Yellow
+
+if (-not $HaveChatModel) {
+    Write-Host "      No chat model selected - skipping." -ForegroundColor DarkGray
+} else {
 
 foreach ($m in $SelectedModels) {
     $modelfilePath = "$USB_Drive\Shared\models\Modelfile-$($m.Local)"
@@ -531,11 +551,22 @@ $installedList = $SelectedModels | ForEach-Object { "$($_.Local)|$($_.Name)|$($_
 Set-Content -Path "$USB_Drive\Shared\models\installed-models.txt" -Value ($installedList -join "`n") -Force -Encoding UTF8
 Write-Host "      Saved model list to installed-models.txt" -ForegroundColor DarkGray
 
+} # end HaveChatModel block for Step 5
+
 # =================================================================
 # STEP 6: Download Ollama (the AI engine)
 # =================================================================
 Write-Host ""
 Write-Host "[6/7] Downloading Ollama AI Engine (Windows)..." -ForegroundColor Yellow
+
+if (-not $HaveChatModel) {
+    if (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe") {
+        Write-Host "      Ollama already installed - keeping it." -ForegroundColor Green
+    } else {
+        Write-Host "      No chat model selected - skipping Ollama engine download." -ForegroundColor DarkGray
+    }
+} else {
+
 $OllamaURL  = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
 $OllamaDest = "$USB_Drive\Shared\bin\ollama-windows-amd64.zip"
 $TempOllamaDir = "$USB_Drive\Shared\bin\temp_ollama"
@@ -585,6 +616,7 @@ if (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe") {
         $downloadErrors += "Ollama Engine"
     }
 }
+} # end HaveChatModel block for Ollama
 
 # =================================================================
 # STEP 6b: Download Stable Diffusion Image Engine
@@ -653,7 +685,9 @@ if (Test-DownloadedFile -Path $ImageModelDest -MinSize $ImageModelMinBytes) {
 Write-Host ""
 Write-Host "[7/7] Importing AI models into the Ollama engine..." -ForegroundColor Yellow
 
-if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
+if (-not $HaveChatModel) {
+    Write-Host "      No chat model selected - nothing to import." -ForegroundColor DarkGray
+} elseif (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
     Write-Host "      ERROR: Ollama not found! Cannot import models." -ForegroundColor Red
     Write-Host "      Please re-run the installer to download Ollama." -ForegroundColor Red
 } else {
@@ -723,20 +757,25 @@ if ($downloadErrors.Count -gt 0) {
 }
 
 Write-Host ""
-Write-Host "  Installed LLM models:" -ForegroundColor White
-foreach ($m in $SelectedModels) {
-    if ($m.Label -eq "UNCENSORED") {
-        $tag = "[UNCENSORED]"
-        $tagColor = "Red"
-    } elseif ($m.Label -eq "CUSTOM") {
-        $tag = "[CUSTOM]"
-        $tagColor = "Green"
-    } else {
-        $tag = "[STANDARD]"
-        $tagColor = "DarkCyan"
+if ($HaveChatModel) {
+    Write-Host "  Installed LLM models:" -ForegroundColor White
+    foreach ($m in $SelectedModels) {
+        if ($m.Label -eq "UNCENSORED") {
+            $tag = "[UNCENSORED]"
+            $tagColor = "Red"
+        } elseif ($m.Label -eq "CUSTOM") {
+            $tag = "[CUSTOM]"
+            $tagColor = "Green"
+        } else {
+            $tag = "[STANDARD]"
+            $tagColor = "DarkCyan"
+        }
+        Write-Host "    - $($m.Name) " -ForegroundColor Gray -NoNewline
+        Write-Host $tag -ForegroundColor $tagColor
     }
-    Write-Host "    - $($m.Name) " -ForegroundColor Gray -NoNewline
-    Write-Host $tag -ForegroundColor $tagColor
+} else {
+    Write-Host "  Chat model: " -ForegroundColor White -NoNewline
+    Write-Host "skipped (image generation only)" -ForegroundColor DarkGray
 }
 
 if (Test-Path "$USB_Drive\Shared\models\CyberRealistic_V3.3_FP16.safetensors") {

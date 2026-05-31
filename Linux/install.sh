@@ -158,11 +158,13 @@ done
 
 echo ""
 echo -e "  ${GRN}[C] CUSTOM - Enter your own HuggingFace GGUF URL${RST}"
+echo -e "  ${GRN}[S] SKIP   - Don't download a chat model (image generation only)${RST}"
 echo ""
 echo -e "  ${DGR}------------------------------------------------${RST}"
 echo -e "  ${GRY}Enter number(s) separated by commas  (e.g. 1,3)${RST}"
 echo -e "  ${GRY}Type 'all' for every preset model${RST}"
 echo -e "  ${GRY}Type 'c' to add a custom model${RST}"
+echo -e "  ${GRY}Type 's' to skip the chat model entirely${RST}"
 echo -e "  ${GRY}Mix them!  (e.g. 1,3,c)${RST}"
 echo ""
 read -r -p "  Your choice: " USER_CHOICE
@@ -178,6 +180,7 @@ fi
 # ----------------------------------------------------------------
 SELECTED_NUMS=()
 HAS_CUSTOM=false
+SKIP_CHAT_MODEL=false
 CUSTOM_FILE=""
 CUSTOM_URL=""
 CUSTOM_LOCAL=""
@@ -187,12 +190,18 @@ CHOICE_LOWER=$(echo "$USER_CHOICE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 
 if [ "$CHOICE_LOWER" = "all" ]; then
     SELECTED_NUMS=(1 2 3 4 5 6)
+elif [ "$CHOICE_LOWER" = "s" ] || [ "$CHOICE_LOWER" = "skip" ] || [ "$CHOICE_LOWER" = "none" ]; then
+    SKIP_CHAT_MODEL=true
+    echo ""
+    echo -e "${YLW}  Skipping chat model - installing image generation only.${RST}"
 else
     IFS=',' read -ra TOKENS <<< "$CHOICE_LOWER"
     for TOKEN in "${TOKENS[@]}"; do
         T=$(echo "$TOKEN" | tr -d ' ')
         if [ "$T" = "c" ] || [ "$T" = "custom" ]; then
             HAS_CUSTOM=true
+        elif [ "$T" = "s" ] || [ "$T" = "skip" ] || [ "$T" = "none" ]; then
+            SKIP_CHAT_MODEL=true
         elif [[ "$T" =~ ^[0-9]+$ ]]; then
             VALID=false
             for N in "${MODEL_NUMS[@]}"; do
@@ -258,12 +267,13 @@ if $HAS_CUSTOM; then
 fi
 
 # ----------------------------------------------------------------
-# Validate at least one model selected
+# Validate at least one model selected (unless skipping chat model)
 # ----------------------------------------------------------------
-if [ "${#SELECTED_NUMS[@]}" -eq 0 ] && ! $HAS_CUSTOM; then
+if [ "${#SELECTED_NUMS[@]}" -eq 0 ] && ! $HAS_CUSTOM && ! $SKIP_CHAT_MODEL; then
     echo ""
     echo -e "${RED}  ERROR: No models selected!${RST}"
     echo -e "${RED}  Please run the installer again and pick at least one model.${RST}"
+    echo -e "${RED}  (Or type 's' to skip the chat model and install image generation only.)${RST}"
     echo ""
     read -n 1 -s -r -p "Press any key to exit..."
     echo ""
@@ -308,13 +318,17 @@ fi
 # Show selection summary
 # ----------------------------------------------------------------
 echo ""
-echo -e "${GRN}  Selected model(s):${RST}"
-for NUM in "${SELECTED_NUMS[@]}"; do
-    NAME=$(get_field "$NUM" NAME)
-    SIZE=$(get_field "$NUM" SIZE)
-    echo -e "    ${WHT}+ ${NAME} (~${SIZE} GB)${RST}"
-done
-$HAS_CUSTOM && echo -e "    ${WHT}+ Custom: ${CUSTOM_FILE}${RST}"
+if $SKIP_CHAT_MODEL && [ "${#SELECTED_NUMS[@]}" -eq 0 ] && ! $HAS_CUSTOM; then
+    echo -e "${YLW}  No chat model selected (image generation only).${RST}"
+else
+    echo -e "${GRN}  Selected model(s):${RST}"
+    for NUM in "${SELECTED_NUMS[@]}"; do
+        NAME=$(get_field "$NUM" NAME)
+        SIZE=$(get_field "$NUM" SIZE)
+        echo -e "    ${WHT}+ ${NAME} (~${SIZE} GB)${RST}"
+    done
+    $HAS_CUSTOM && echo -e "    ${WHT}+ Custom: ${CUSTOM_FILE}${RST}"
+fi
 echo ""
 
 # ================================================================
@@ -489,8 +503,18 @@ echo -e "${YLW}[6/7] Downloading Ollama AI Engine (Linux)...${RST}"
 
 OLLAMA_BIN="$SHARED_BIN/ollama-linux"
 
+# Determine whether any chat model is being installed; Ollama is only needed for chat.
+HAVE_CHAT_MODEL=false
+{ [ "${#SELECTED_NUMS[@]}" -gt 0 ] || $HAS_CUSTOM; } && HAVE_CHAT_MODEL=true
+
+if ! $HAVE_CHAT_MODEL; then
+    if [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
+        echo -e "${GRN}      Ollama already installed - keeping it.${RST}"
+    else
+        echo -e "${DGR}      No chat model selected - skipping Ollama engine download.${RST}"
+    fi
 # Validate: must exist, be a real ELF binary, and > 10 MB
-if [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
+elif [ -f "$OLLAMA_BIN" ] && is_elf "$OLLAMA_BIN" && file_ok "$OLLAMA_BIN" 10000000; then
     echo -e "${GRN}      Ollama already installed! Skipping...${RST}"
 else
     # Remove any stale/corrupted file
@@ -611,7 +635,9 @@ fi
 echo ""
 echo -e "${YLW}[7/7] Importing AI models into the Ollama engine...${RST}"
 
-if [ ! -x "$OLLAMA_BIN" ]; then
+if ! $HAVE_CHAT_MODEL; then
+    echo -e "${DGR}      No chat model selected - nothing to import.${RST}"
+elif [ ! -x "$OLLAMA_BIN" ]; then
     echo -e "${RED}      ERROR: Ollama not found! Cannot import models.${RST}"
     echo -e "${RED}      Please re-run the installer to download Ollama.${RST}"
 else
@@ -696,19 +722,23 @@ else
 fi
 
 echo ""
-echo -e "${WHT}  Installed LLM models:${RST}"
-for NUM in "${SELECTED_NUMS[@]}"; do
-    NAME=$(get_field "$NUM" NAME)
-    LABEL=$(get_field "$NUM" LABEL)
-    if [ "$LABEL" = "UNCENSORED" ]; then
-        TAG="${RED}[UNCENSORED]${RST}"
-    else
-        TAG="${CYN}[STANDARD]${RST}"
+if $HAVE_CHAT_MODEL; then
+    echo -e "${WHT}  Installed LLM models:${RST}"
+    for NUM in "${SELECTED_NUMS[@]}"; do
+        NAME=$(get_field "$NUM" NAME)
+        LABEL=$(get_field "$NUM" LABEL)
+        if [ "$LABEL" = "UNCENSORED" ]; then
+            TAG="${RED}[UNCENSORED]${RST}"
+        else
+            TAG="${CYN}[STANDARD]${RST}"
+        fi
+        echo -e "${GRY}    - ${NAME} ${TAG}"
+    done
+    if $HAS_CUSTOM && [ -n "$CUSTOM_URL" ]; then
+        echo -e "${GRY}    - Custom: ${CUSTOM_FILE} ${GRN}[CUSTOM]${RST}"
     fi
-    echo -e "${GRY}    - ${NAME} ${TAG}"
-done
-if $HAS_CUSTOM && [ -n "$CUSTOM_URL" ]; then
-    echo -e "${GRY}    - Custom: ${CUSTOM_FILE} ${GRN}[CUSTOM]${RST}"
+else
+    echo -e "${WHT}  Chat model:${RST} ${DGR}skipped (image generation only)${RST}"
 fi
 
 if file_ok "$IMAGE_MODEL" 2000000000; then

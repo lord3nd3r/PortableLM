@@ -27,33 +27,46 @@ export OLLAMA_HOST="127.0.0.1:11434"
 mkdir -p "$OLLAMA_RUNTIME/runners" "$OLLAMA_RUNTIME/tmp"
 # -------------------------------------------------------
 
-# Check if the portable Mac engine is downloaded
-if [ ! -f "$SHARED_DIR/bin/ollama-darwin" ]; then
-    echo "==================================================="
-    echo "  ERROR: Mac AI Engine Not Found!"
-    echo "==================================================="
-    echo ""
-    echo "  It looks like the AI engine hasn't been set up yet."
-    echo "  Please double-click 'install.command' in this Mac"
-    echo "  folder first to safely download the components!"
-    echo ""
-    read -n 1 -s -r -p "Press any key to continue..."
-    exit 1
-fi
+PORTABLE_OLLAMA="$SHARED_DIR/bin/ollama-darwin"
+OLLAMA_PID=""
 
-# Check if Ollama is already running
+# Check if Ollama is already running (system or previously started)
 if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
-    echo "[OK] Ollama engine is already running!"
-else
-    echo "Starting offline Mac AI Engine..."
-    HOME="$OLLAMA_RUNTIME" "$SHARED_DIR/bin/ollama-darwin" serve &
+    echo "[OK] Ollama is already running - using existing instance."
+elif [ -f "$PORTABLE_OLLAMA" ]; then
+    # Start the portable engine bundled on the USB
+    echo "Starting portable AI engine..."
+    HOME="$OLLAMA_RUNTIME" "$PORTABLE_OLLAMA" serve &
     OLLAMA_PID=$!
-    
     echo "Waiting for engine to initialize..."
     until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
         sleep 1
     done
     echo "[OK] Engine is online!"
+elif command -v ollama > /dev/null 2>&1; then
+    # Fall back to system-installed Ollama
+    echo "Portable engine not found - starting system Ollama..."
+    ollama serve &
+    OLLAMA_PID=$!
+    echo "Waiting for engine to initialize..."
+    until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
+        sleep 1
+    done
+    echo "[OK] System Ollama is online!"
+else
+    echo "==================================================="
+    echo "  ERROR: No Ollama engine found!"
+    echo "==================================================="
+    echo ""
+    echo "  No Ollama engine is running and none was found on"
+    echo "  this system. To fix this, either:"
+    echo "    1. Double-click 'Mac/install.command' to download"
+    echo "       the portable engine, OR"
+    echo "    2. Install Ollama system-wide from https://ollama.com"
+    echo "       and make sure it is running before starting."
+    echo ""
+    read -n 1 -s -r -p "Press any key to exit..."
+    exit 1
 fi
 
 echo ""
