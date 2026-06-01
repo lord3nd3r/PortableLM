@@ -2269,7 +2269,7 @@
           </div>
         </div>
         <div class="sys-row">
-          <label>Download Model</label>
+          <label>Download Ollama Model</label>
           <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;align-items:flex-start;">
             <input type="text" id="pull-model-name" class="sys-select" placeholder="e.g. llama3.2:1b" style="flex:1;min-width:150px;">
             <button class="sys-btn" id="pull-model-btn">Pull</button>
@@ -2283,9 +2283,10 @@
             </div>
             <div id="pull-progress-msg" style="color:var(--muted);margin-top:4px;"></div>
           </div>
+          <div class="sys-hint" style="margin-top:4px;">Ollama registry models (downloads via ollama pull)</div>
         </div>
         <div class="sys-row">
-          <label>Download GGUF/Safetensors</label>
+          <label>Download GGUF / Safetensors</label>
           <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;align-items:flex-start;">
             <input type="text" id="hf-url" class="sys-select" placeholder="https://huggingface.co/user/model/resolve/main/model.gguf" style="flex:1;min-width:200px;font-size:11px;">
             <button class="sys-btn" id="hf-download-btn">Download</button>
@@ -2299,7 +2300,7 @@
             </div>
             <div id="hf-progress-msg" style="color:var(--muted);margin-top:4px;"></div>
           </div>
-          <div class="sys-hint" style="margin-top:4px;">Paste direct download link from HuggingFace</div>
+          <div class="sys-hint" style="margin-top:4px;">Paste direct download link from HuggingFace (raw file URL)</div>
         </div>
       </div>
 
