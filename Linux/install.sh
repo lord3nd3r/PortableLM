@@ -561,7 +561,23 @@ echo -e "${YLW}[6b/7] Downloading Stable Diffusion Image Engine (Linux)...${RST}
 
 SD_DIR="$SHARED_BIN/sd-linux"
 SD_BIN="$SD_DIR/sd"
-SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/master-656-0e4ee04/sd-master-0e4ee04-bin-Linux-Ubuntu-24.04-x86_64.zip"
+SD_REL="master-663-be65ac7"
+SD_COMMIT="be65ac7"
+
+# Auto-detect best available GPU backend for stable-diffusion.cpp
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    echo -e "      Detected NVIDIA GPU — using CUDA build"
+    SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${SD_REL}/sd-master-${SD_COMMIT}-bin-Linux-Ubuntu-24.04-x86_64-cuda-12.zip"
+elif command -v vulkaninfo &>/dev/null && vulkaninfo --summary &>/dev/null 2>&1; then
+    echo -e "      Detected Vulkan GPU — using Vulkan build"
+    SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${SD_REL}/sd-master-${SD_COMMIT}-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"
+elif command -v rocm-smi &>/dev/null && rocm-smi &>/dev/null 2>&1; then
+    echo -e "      Detected AMD ROCm GPU — using ROCm build"
+    SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${SD_REL}/sd-master-${SD_COMMIT}-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.2.1.zip"
+else
+    echo -e "      No GPU detected — using CPU build"
+    SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${SD_REL}/sd-master-${SD_COMMIT}-bin-Linux-Ubuntu-24.04-x86_64.zip"
+fi
 
 if [ -f "$SD_BIN" ] && file_ok "$SD_BIN" 1000000; then
     echo -e "${GRN}      Stable Diffusion engine already installed! Skipping...${RST}"

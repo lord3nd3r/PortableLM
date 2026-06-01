@@ -615,7 +615,33 @@ if (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe") {
 # =================================================================
 Write-Host ""
 Write-Host "[6b/7] Downloading Stable Diffusion Image Engine (Windows)..." -ForegroundColor Yellow
-$SDZipURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-656-0e4ee04/sd-master-0e4ee04-bin-win-avx2-x64.zip"
+$SDRel = "master-663-be65ac7"
+$SDCommit = "be65ac7"
+
+# Auto-detect best available GPU backend
+$SDZipURL = $null
+if (Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue) {
+    $nvOut = & nvidia-smi.exe 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "      Detected NVIDIA GPU — using CUDA build" -ForegroundColor Cyan
+        $SDZipURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/${SDRel}/sd-master-${SDCommit}-bin-win-cuda12-x64.zip"
+    }
+}
+if (-not $SDZipURL) {
+    # Check Vulkan via vulkaninfo (ships with Vulkan SDK / GPU drivers)
+    $vulkanInfo = Get-Command "vulkaninfo.exe" -ErrorAction SilentlyContinue
+    if ($vulkanInfo) {
+        $vkOut = & vulkaninfo.exe --summary 2>&1
+        if ($LASTEXITCODE -eq 0 -and ($vkOut -match "GPU")) {
+            Write-Host "      Detected Vulkan GPU — using Vulkan build" -ForegroundColor Cyan
+            $SDZipURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/${SDRel}/sd-master-${SDCommit}-bin-win-vulkan-x64.zip"
+        }
+    }
+}
+if (-not $SDZipURL) {
+    Write-Host "      No GPU detected — using CPU (AVX2) build" -ForegroundColor Cyan
+    $SDZipURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/${SDRel}/sd-master-${SDCommit}-bin-win-avx2-x64.zip"
+}
 $SDZipDest = "$USB_Drive\Shared\bin\sd-windows.zip"
 $SDDir = "$USB_Drive\Shared\bin\sd-windows"
 

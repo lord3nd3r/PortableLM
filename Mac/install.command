@@ -532,7 +532,8 @@ echo -e "${YLW}[6b/7] Downloading Stable Diffusion Image Engine (Mac)...${RST}"
 
 SD_DIR="$SHARED_BIN/sd-mac"
 SD_BIN="$SD_DIR/sd"
-SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/master-656-0e4ee04/sd-master-0e4ee04-bin-Darwin-macOS-15.7.7-arm64.zip"
+# macOS arm64 build uses Metal GPU acceleration automatically
+SD_ZIP_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/master-663-be65ac7/sd-master-be65ac7-bin-Darwin-macOS-15.7.7-arm64.zip"
 
 if [ -f "$SD_BIN" ] && file_ok "$SD_BIN" 1000000; then
     echo -e "${GRN}      Stable Diffusion engine already installed! Skipping...${RST}"
