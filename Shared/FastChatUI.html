@@ -2268,6 +2268,22 @@
             <span class="sys-hint" id="engine-switch-status" style="align-self:center;"></span>
           </div>
         </div>
+        <div class="sys-row">
+          <label>Download Model</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;align-items:flex-start;">
+            <input type="text" id="pull-model-name" class="sys-select" placeholder="e.g. llama3.2:1b" style="flex:1;min-width:150px;">
+            <button class="sys-btn" id="pull-model-btn">Pull</button>
+          </div>
+          <div id="pull-model-progress" style="display:none;margin-top:8px;font-size:12px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div style="flex:1;background:var(--bg2);border-radius:4px;height:8px;overflow:hidden;">
+                <div id="pull-progress-bar" style="height:100%;background:var(--accent);width:0%;transition:width 0.3s;"></div>
+              </div>
+              <span id="pull-progress-pct">0%</span>
+            </div>
+            <div id="pull-progress-msg" style="color:var(--muted);margin-top:4px;"></div>
+          </div>
+        </div>
       </div>
 
         <!-- Chat / Messages -->
@@ -4099,6 +4115,93 @@
           }
         };
         
+        poll();
+      }
+
+      // Model pull handler
+      const pullModelBtn = document.getElementById('pull-model-btn');
+      const pullModelName = document.getElementById('pull-model-name');
+      const pullProgress = document.getElementById('pull-model-progress');
+      const pullBar = document.getElementById('pull-progress-bar');
+      const pullPct = document.getElementById('pull-progress-pct');
+      const pullMsg = document.getElementById('pull-progress-msg');
+      
+      if (pullModelBtn) {
+        pullModelBtn.addEventListener('click', async () => {
+          const model = pullModelName.value.trim();
+          if (!model) { toast('Enter a model name'); return; }
+          
+          pullModelBtn.disabled = true;
+          pullProgress.style.display = 'block';
+          pullBar.style.width = '0%';
+          pullPct.textContent = '0%';
+          pullMsg.textContent = 'Starting...';
+          pullMsg.style.color = 'var(--muted)';
+          
+          try {
+            const r = await fetch('/api/pull-model', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ model })
+            });
+            const d = await r.json();
+            if (!r.ok || d.error) {
+              pullMsg.textContent = d.error || 'Failed';
+              pullMsg.style.color = 'var(--red)';
+              pullModelBtn.disabled = false;
+              return;
+            }
+            pollModelPull(d.job_id);
+          } catch (e) {
+            pullMsg.textContent = 'Connection error';
+            pullMsg.style.color = 'var(--red)';
+            pullModelBtn.disabled = false;
+          }
+        });
+      }
+      
+      async function pollModelPull(jobId) {
+        const maxPolls = 600; // 10 minutes
+        let polls = 0;
+        
+        const poll = async () => {
+          polls++;
+          try {
+            const r = await fetch(`/api/pull-model-status?job_id=${jobId}`);
+            const d = await r.json();
+            
+            pullBar.style.width = (d.progress_pct || 0) + '%';
+            pullPct.textContent = (d.progress_pct || 0) + '%';
+            pullMsg.textContent = d.message || '';
+            
+            if (d.status === 'complete') {
+              pullMsg.textContent = '✓ Download complete!';
+              pullMsg.style.color = 'var(--green, #4caf50)';
+              pullModelBtn.disabled = false;
+              await fetchModels();
+              return;
+            }
+            if (d.status === 'failed') {
+              pullMsg.textContent = '⚠ ' + (d.error || 'Failed');
+              pullMsg.style.color = 'var(--red)';
+              pullModelBtn.disabled = false;
+              return;
+            }
+            if (polls < maxPolls) setTimeout(poll, 1000);
+            else {
+              pullMsg.textContent = '⚠ Timeout';
+              pullMsg.style.color = 'var(--red)';
+              pullModelBtn.disabled = false;
+            }
+          } catch {
+            if (polls < maxPolls) setTimeout(poll, 2000);
+            else {
+              pullMsg.textContent = '⚠ Connection lost';
+              pullMsg.style.color = 'var(--red)';
+              pullModelBtn.disabled = false;
+            }
+          }
+        };
         poll();
       }
 

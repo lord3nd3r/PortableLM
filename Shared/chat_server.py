@@ -103,6 +103,41 @@ def _cleanup_old_engine_startup_jobs():
         for jid in stale:
             del ENGINE_STARTUP_JOBS[jid]
 
+# ── Model Pull Job Tracking ────────────────────────────────────
+MODEL_PULL_JOBS = {}
+MODEL_PULL_JOBS_LOCK = threading.RLock()
+
+def _register_model_pull_job(job_id, model_name):
+    with MODEL_PULL_JOBS_LOCK:
+        MODEL_PULL_JOBS[job_id] = {
+            "status": "starting",
+            "model": model_name,
+            "progress_pct": 0,
+            "message": "Starting download...",
+            "downloaded": "",
+            "total": "",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "error": None,
+        }
+
+def _update_model_pull_job(job_id, **kwargs):
+    with MODEL_PULL_JOBS_LOCK:
+        if job_id in MODEL_PULL_JOBS:
+            MODEL_PULL_JOBS[job_id].update(kwargs)
+            MODEL_PULL_JOBS[job_id]["updated_at"] = time.time()
+
+def _get_model_pull_job(job_id):
+    with MODEL_PULL_JOBS_LOCK:
+        return MODEL_PULL_JOBS.get(job_id, {}).copy()
+
+def _cleanup_old_model_pull_jobs():
+    now = time.time()
+    with MODEL_PULL_JOBS_LOCK:
+        stale = [jid for jid, j in MODEL_PULL_JOBS.items() if now - j["updated_at"] > 600]
+        for jid in stale:
+            del MODEL_PULL_JOBS[jid]
+
 # Optional: psutil for hardware stats (graceful fallback to native APIs if not installed)
 try:
     import psutil
@@ -846,6 +881,78 @@ def _start_ollama():
     except Exception:
         return False
 
+def _run_model_pull(job_id, model_name):
+    """Run 'ollama pull' and track progress. Called in background thread."""
+    if not OLLAMA_BIN or not os.path.isfile(OLLAMA_BIN):
+        _update_model_pull_job(job_id, status="failed", error="Ollama binary not found")
+        return
+    
+    # Ensure Ollama is running first
+    if not _is_ollama_running():
+        _update_model_pull_job(job_id, message="Starting Ollama...")
+        if not _start_ollama():
+            _update_model_pull_job(job_id, status="failed", error="Could not start Ollama")
+            return
+    
+    env = os.environ.copy()
+    env["OLLAMA_MODELS"] = os.path.join(SCRIPT_DIR, "models", "ollama_data")
+    env["OLLAMA_HOST"] = "127.0.0.1:11434"
+    
+    try:
+        proc = subprocess.Popen(
+            [OLLAMA_BIN, "pull", model_name],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        # Parse progress output: "pulling abc123... 45% ▕██████     ▏ 1.2 GB/2.5 GB"
+        pct_pattern = re.compile(r'(\d+)%')
+        size_pattern = re.compile(r'([\d.]+\s*[KMGT]?B)\s*/\s*([\d.]+\s*[KMGT]?B)', re.IGNORECASE)
+        
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for completion
+            if "success" in line.lower():
+                _update_model_pull_job(job_id, status="complete", progress_pct=100, message="Download complete!")
+                break
+            
+            # Check for errors
+            if "error" in line.lower() or "failed" in line.lower():
+                _update_model_pull_job(job_id, status="failed", error=line)
+                break
+            
+            # Parse progress percentage
+            pct_match = pct_pattern.search(line)
+            size_match = size_pattern.search(line)
+            
+            update = {"message": line[:80]}
+            if pct_match:
+                update["progress_pct"] = int(pct_match.group(1))
+            if size_match:
+                update["downloaded"] = size_match.group(1)
+                update["total"] = size_match.group(2)
+            
+            _update_model_pull_job(job_id, **update)
+        
+        proc.wait()
+        
+        # Check final status
+        job = _get_model_pull_job(job_id)
+        if job.get("status") not in ("complete", "failed"):
+            if proc.returncode == 0:
+                _update_model_pull_job(job_id, status="complete", progress_pct=100, message="Download complete!")
+            else:
+                _update_model_pull_job(job_id, status="failed", error=f"Pull failed with exit code {proc.returncode}")
+                
+    except Exception as e:
+        _update_model_pull_job(job_id, status="failed", error=str(e))
+
 def _parse_sd_output(pipe, job_id, total_steps):
     """Read sd stdout+stderr line-by-line and update job progress.
     stable-diffusion.cpp prints step info like 'step 1 sampling completed'.
@@ -1256,6 +1363,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/engine-startup-status":
             self._get_engine_startup_status()
 
+        # Model pull progress API
+        elif path == "/api/pull-model-status":
+            self._get_model_pull_status()
+
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
             self._proxy_ollama("GET")
@@ -1286,6 +1397,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/api/switch-engine":
             self._switch_engine_endpoint()
+
+        # Model pull API
+        elif path == "/api/pull-model":
+            self._pull_model_endpoint()
 
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
@@ -1838,6 +1953,83 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
         if job.get("status") == "failed":
             resp["error"] = job.get("error", "Unknown error.")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(resp).encode())
+
+    def _pull_model_endpoint(self):
+        """Start downloading a model via 'ollama pull'."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+        
+        model_name = payload.get("model", "").strip()
+        if not model_name:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Model name required"}).encode())
+            return
+        
+        if not OLLAMA_BIN:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Ollama not installed"}).encode())
+            return
+        
+        _cleanup_old_model_pull_jobs()
+        job_id = str(uuid.uuid4())
+        _register_model_pull_job(job_id, model_name)
+        
+        threading.Thread(target=_run_model_pull, args=(job_id, model_name), daemon=True).start()
+        
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": True, "job_id": job_id, "model": model_name}).encode())
+
+    def _get_model_pull_status(self):
+        """Poll endpoint for model pull progress."""
+        query = parse_qs(urlparse(self.path).query)
+        job_id = query.get("job_id", [None])[0]
+        if not job_id:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing job_id parameter"}).encode())
+            return
+
+        job = _get_model_pull_job(job_id)
+        if not job:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Job not found"}).encode())
+            return
+
+        elapsed = time.time() - job.get("started_at", time.time())
+        resp = {
+            "status": job.get("status"),
+            "model": job.get("model"),
+            "progress_pct": job.get("progress_pct", 0),
+            "message": job.get("message", ""),
+            "downloaded": job.get("downloaded", ""),
+            "total": job.get("total", ""),
+            "elapsed_secs": int(elapsed),
+        }
+        if job.get("status") == "failed":
+            resp["error"] = job.get("error", "Unknown error")
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
