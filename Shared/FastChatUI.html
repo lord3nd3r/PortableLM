@@ -2946,6 +2946,12 @@
           const llamaSel = document.getElementById('llama-model-select');
           if (engSel) {
             engSel.value = activeEngine;
+            // Disable llama.cpp option if binary is not installed
+            const llamaOpt = engSel.querySelector('option[value="llama"]');
+            if (llamaOpt) {
+              llamaOpt.disabled = !d.llama_available;
+              llamaOpt.textContent = d.llama_available ? 'llama.cpp' : 'llama.cpp (not installed)';
+            }
             // Populate llama model list
             const llamaModels = d.llama_models || [];
             if (llamaSel) {
@@ -3984,12 +3990,15 @@
               body: JSON.stringify({ engine, model })
             });
             const d = await r.json();
-            if (d.ok) {
+            if (r.ok && d.ok) {
               if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Done ✓'; engineSwitchStatus.style.color = 'var(--green, #4caf50)'; }
               await fetchModels();
               await updateEngineStatus();
             } else {
-              if (engineSwitchStatus) { engineSwitchStatus.textContent = d.error || 'Failed'; engineSwitchStatus.style.color = 'var(--red)'; }
+              const msg = d.error || 'Failed';
+              if (engineSwitchStatus) { engineSwitchStatus.textContent = '⚠ ' + msg; engineSwitchStatus.style.color = 'var(--red)'; }
+              // Revert the dropdown to the actual active engine
+              await updateEngineStatus();
             }
           } catch {
             if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Error'; engineSwitchStatus.style.color = 'var(--red)'; }
