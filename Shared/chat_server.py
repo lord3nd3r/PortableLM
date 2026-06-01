@@ -140,42 +140,42 @@ def _test_sd_binary():
         return False
 
 def _detect_sd_backend():
-    """Probe for available GPU backends. Returns (backend, rng) tuple.
+    """Probe which GPU backend this sd-cli binary was compiled with.
 
-    backend: string passed to sd-cli --backend (e.g. 'cuda0', 'vulkan0', 'hip0')
-             or None to omit the flag (CPU-only).
-    rng:     string passed to sd-cli --rng ('cuda' or 'cpu').
+    Tries each candidate by running the binary with --backend <name> against a
+    dummy path. The backend validity check happens before model loading, so if
+    the binary returns 'was not found' the backend is not compiled in. Any other
+    exit (model error, etc.) means the backend is supported.
+
+    Returns (backend, rng) where backend is None for CPU-only.
     """
-    # 1. NVIDIA CUDA
-    try:
-        r = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=5
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return 'cuda0', 'cuda'
-    except Exception:
-        pass
+    if not SD_BINARY or not os.path.isfile(SD_BINARY):
+        return None, 'cpu'
 
-    # 2. AMD ROCm / HIP
-    try:
-        r = subprocess.run(['rocm-smi', '--showproductname'],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            return 'hip0', 'cpu'
-    except Exception:
-        pass
+    sd_dir = os.path.dirname(os.path.abspath(SD_BINARY))
+    env = os.environ.copy()
+    existing_ldpath = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = sd_dir + (":" + existing_ldpath if existing_ldpath else "")
 
-    # 3. Vulkan (cross-vendor: NVIDIA, AMD, Intel)
-    try:
-        r = subprocess.run(['vulkaninfo', '--summary'],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            return 'vulkan0', 'cpu'
-    except Exception:
-        pass
+    # Candidate order: prefer CUDA (fastest), then HIP (AMD), then Vulkan
+    # rng=cuda only makes sense with a CUDA build
+    candidates = [('cuda0', 'cuda'), ('hip0', 'cpu'), ('vulkan0', 'cpu')]
 
-    # 4. CPU fallback
+    for backend, rng in candidates:
+        try:
+            r = subprocess.run(
+                [SD_BINARY, '--backend', backend, '-m', '/dev/null',
+                 '-p', 'probe', '-o', '/dev/null'],
+                capture_output=True, text=True, env=env, timeout=8
+            )
+            combined = (r.stdout + r.stderr).lower()
+            if 'was not found' in combined or 'backend config failed' in combined:
+                continue  # this backend is not compiled in
+            # Any other result (model error, etc.) means the backend exists
+            return backend, rng
+        except Exception:
+            continue
+
     return None, 'cpu'
 
 SD_BACKEND, SD_RNG = _detect_sd_backend()
