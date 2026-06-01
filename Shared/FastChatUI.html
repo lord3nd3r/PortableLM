@@ -2894,7 +2894,10 @@
             D.imgGenBtn.disabled = true;
           } else {
             D.imgEngineDot.className = 'img-engine-dot on';
-            D.imgEngineStatus.textContent = 'Ready';
+            const backendLabel = d.sd_backend && d.sd_backend !== 'cpu'
+              ? `Ready · ${d.sd_backend.toUpperCase().replace(/\d+$/, '')} GPU`
+              : 'Ready · CPU';
+            D.imgEngineStatus.textContent = backendLabel;
             D.imgWarn.style.display = 'none';
           }
 

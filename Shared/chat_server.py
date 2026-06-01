@@ -139,6 +139,47 @@ def _test_sd_binary():
     except Exception:
         return False
 
+def _detect_sd_backend():
+    """Probe for available GPU backends. Returns (backend, rng) tuple.
+
+    backend: string passed to sd-cli --backend (e.g. 'cuda0', 'vulkan0', 'hip0')
+             or None to omit the flag (CPU-only).
+    rng:     string passed to sd-cli --rng ('cuda' or 'cpu').
+    """
+    # 1. NVIDIA CUDA
+    try:
+        r = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return 'cuda0', 'cuda'
+    except Exception:
+        pass
+
+    # 2. AMD ROCm / HIP
+    try:
+        r = subprocess.run(['rocm-smi', '--showproductname'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return 'hip0', 'cpu'
+    except Exception:
+        pass
+
+    # 3. Vulkan (cross-vendor: NVIDIA, AMD, Intel)
+    try:
+        r = subprocess.run(['vulkaninfo', '--summary'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return 'vulkan0', 'cpu'
+    except Exception:
+        pass
+
+    # 4. CPU fallback
+    return None, 'cpu'
+
+SD_BACKEND, SD_RNG = _detect_sd_backend()
+
 # Ollama binary path for engine management
 OLLAMA_BIN = None
 if platform.system() == "Windows":
@@ -573,11 +614,13 @@ def _run_sd_generation(job_id, payload, output_path):
         "--height", str(height),
         "--seed", str(seed),
         "--sampling-method", sampling,
-        "--rng", "cuda",
+        "--rng", SD_RNG,
         "-v",
     ]
     if negative:
         cmd += ["-n", negative]
+    if SD_BACKEND:
+        cmd += ["--backend", SD_BACKEND]
 
     _update_image_job(
         job_id,
@@ -1082,6 +1125,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             "sd_binary": bool(SD_BINARY),
             "sd_model": len(current_models) > 0,
             "sd_healthy": _test_sd_binary(),
+            "sd_backend": SD_BACKEND or "cpu",
         })
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
