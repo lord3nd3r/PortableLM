@@ -78,7 +78,22 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────
 CHAT_SERVER_PORT = 3333
 OLLAMA_HOST = "http://127.0.0.1:11434"
-LLAMA_HOST   = "http://127.0.0.1:8080"
+
+def _find_free_port(start=8080, end=8200):
+    """Return the first TCP port in [start, end] not already bound."""
+    import socket
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return start  # fallback
+
+LLAMA_PORT = _find_free_port()
+LLAMA_HOST = f"http://127.0.0.1:{LLAMA_PORT}"
 
 # Active engine is loaded from settings after SETTINGS_FILE is defined.
 # Default here; overwritten in main() once settings are read.
@@ -572,7 +587,7 @@ def _start_llama(model_path):
             LLAMA_BIN,
             "--model", model_path,
             "--host", "127.0.0.1",
-            "--port", "8080",
+            "--port", str(LLAMA_PORT),
             "--ctx-size", "4096",
             "--n-predict", "-1",
             "--log-disable",
