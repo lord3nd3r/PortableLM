@@ -138,6 +138,87 @@ def _cleanup_old_model_pull_jobs():
         for jid in stale:
             del MODEL_PULL_JOBS[jid]
 
+# ── HuggingFace Download Job Tracking ──────────────────────────
+HF_DOWNLOAD_JOBS = {}
+HF_DOWNLOAD_JOBS_LOCK = threading.RLock()
+
+def _register_hf_download_job(job_id, url, filename, model_type):
+    with HF_DOWNLOAD_JOBS_LOCK:
+        HF_DOWNLOAD_JOBS[job_id] = {
+            "status": "starting",
+            "url": url,
+            "filename": filename,
+            "model_type": model_type,  # "gguf" or "safetensors"
+            "progress_pct": 0,
+            "message": "Starting download...",
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "error": None,
+        }
+
+def _update_hf_download_job(job_id, **kwargs):
+    with HF_DOWNLOAD_JOBS_LOCK:
+        if job_id in HF_DOWNLOAD_JOBS:
+            HF_DOWNLOAD_JOBS[job_id].update(kwargs)
+            HF_DOWNLOAD_JOBS[job_id]["updated_at"] = time.time()
+
+def _get_hf_download_job(job_id):
+    with HF_DOWNLOAD_JOBS_LOCK:
+        return HF_DOWNLOAD_JOBS.get(job_id, {}).copy()
+
+def _format_bytes(b):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+def _run_hf_download(job_id, url, dest_path):
+    """Download a file from HuggingFace with progress tracking."""
+    try:
+        _update_hf_download_job(job_id, message="Connecting...")
+        
+        req = urllib.request.Request(url, headers={"User-Agent": "PortableLM/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            total = int(response.headers.get('Content-Length', 0))
+            _update_hf_download_job(job_id, total_bytes=total, 
+                                    message=f"Downloading {_format_bytes(total)}...")
+            
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1MB chunks
+            last_update = time.time()
+            
+            with open(dest_path, 'wb') as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Update progress every 0.5s to avoid spam
+                    now = time.time()
+                    if now - last_update > 0.5:
+                        pct = int((downloaded / total) * 100) if total else 0
+                        _update_hf_download_job(job_id, 
+                            progress_pct=pct,
+                            downloaded_bytes=downloaded,
+                            message=f"{_format_bytes(downloaded)} / {_format_bytes(total)}")
+                        last_update = now
+        
+        _update_hf_download_job(job_id, status="complete", progress_pct=100,
+                                message="Download complete!")
+    except Exception as e:
+        # Clean up partial file
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except:
+                pass
+        _update_hf_download_job(job_id, status="failed", error=str(e))
+
 # Optional: psutil for hardware stats (graceful fallback to native APIs if not installed)
 try:
     import psutil
@@ -1367,6 +1448,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/pull-model-status":
             self._get_model_pull_status()
 
+        # HuggingFace download progress API
+        elif path == "/api/hf-download-status":
+            self._get_hf_download_status()
+
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
             self._proxy_ollama("GET")
@@ -1401,6 +1486,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         # Model pull API
         elif path == "/api/pull-model":
             self._pull_model_endpoint()
+
+        # HuggingFace download API
+        elif path == "/api/hf-download":
+            self._hf_download_endpoint()
 
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
@@ -2026,6 +2115,122 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             "message": job.get("message", ""),
             "downloaded": job.get("downloaded", ""),
             "total": job.get("total", ""),
+            "elapsed_secs": int(elapsed),
+        }
+        if job.get("status") == "failed":
+            resp["error"] = job.get("error", "Unknown error")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(resp).encode())
+
+    def _hf_download_endpoint(self):
+        """Download a model file from HuggingFace."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+        
+        url = payload.get("url", "").strip()
+        model_type = payload.get("type", "").lower()  # "gguf" or "safetensors"
+        
+        if not url:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "URL required"}).encode())
+            return
+        
+        # Validate URL is from HuggingFace
+        if "huggingface.co" not in url and "hf.co" not in url:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Only HuggingFace URLs supported"}).encode())
+            return
+        
+        # Extract filename from URL
+        filename = url.split("/")[-1].split("?")[0]
+        if not filename:
+            filename = "model.bin"
+        
+        # Auto-detect type from extension if not provided
+        if not model_type:
+            if filename.lower().endswith(".gguf"):
+                model_type = "gguf"
+            elif filename.lower().endswith(".safetensors"):
+                model_type = "safetensors"
+            else:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Could not detect model type. Use .gguf or .safetensors file"}).encode())
+                return
+        
+        # Determine destination
+        models_dir = os.path.join(SCRIPT_DIR, "models")
+        dest_path = os.path.join(models_dir, filename)
+        
+        if os.path.exists(dest_path):
+            self.send_response(409)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"File '{filename}' already exists"}).encode())
+            return
+        
+        job_id = str(uuid.uuid4())
+        _register_hf_download_job(job_id, url, filename, model_type)
+        
+        threading.Thread(target=_run_hf_download, args=(job_id, url, dest_path), daemon=True).start()
+        
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "ok": True, 
+            "job_id": job_id, 
+            "filename": filename,
+            "type": model_type
+        }).encode())
+
+    def _get_hf_download_status(self):
+        """Poll endpoint for HuggingFace download progress."""
+        query = parse_qs(urlparse(self.path).query)
+        job_id = query.get("job_id", [None])[0]
+        if not job_id:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing job_id parameter"}).encode())
+            return
+
+        job = _get_hf_download_job(job_id)
+        if not job:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Job not found"}).encode())
+            return
+
+        elapsed = time.time() - job.get("started_at", time.time())
+        resp = {
+            "status": job.get("status"),
+            "filename": job.get("filename"),
+            "type": job.get("model_type"),
+            "progress_pct": job.get("progress_pct", 0),
+            "message": job.get("message", ""),
+            "downloaded": _format_bytes(job.get("downloaded_bytes", 0)),
+            "total": _format_bytes(job.get("total_bytes", 0)),
             "elapsed_secs": int(elapsed),
         }
         if job.get("status") == "failed":

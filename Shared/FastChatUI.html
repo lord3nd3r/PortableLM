@@ -2284,6 +2284,23 @@
             <div id="pull-progress-msg" style="color:var(--muted);margin-top:4px;"></div>
           </div>
         </div>
+        <div class="sys-row">
+          <label>Download GGUF/Safetensors</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;align-items:flex-start;">
+            <input type="text" id="hf-url" class="sys-select" placeholder="https://huggingface.co/user/model/resolve/main/model.gguf" style="flex:1;min-width:200px;font-size:11px;">
+            <button class="sys-btn" id="hf-download-btn">Download</button>
+          </div>
+          <div id="hf-download-progress" style="display:none;margin-top:8px;font-size:12px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <div style="flex:1;background:var(--bg2);border-radius:4px;height:8px;overflow:hidden;">
+                <div id="hf-progress-bar" style="height:100%;background:var(--accent);width:0%;transition:width 0.3s;"></div>
+              </div>
+              <span id="hf-progress-pct">0%</span>
+            </div>
+            <div id="hf-progress-msg" style="color:var(--muted);margin-top:4px;"></div>
+          </div>
+          <div class="sys-hint" style="margin-top:4px;">Paste direct download link from HuggingFace</div>
+        </div>
       </div>
 
         <!-- Chat / Messages -->
@@ -4199,6 +4216,95 @@
               pullMsg.textContent = '⚠ Connection lost';
               pullMsg.style.color = 'var(--red)';
               pullModelBtn.disabled = false;
+            }
+          }
+        };
+        poll();
+      }
+
+      // HuggingFace direct download handler
+      const hfUrl = document.getElementById('hf-url');
+      const hfBtn = document.getElementById('hf-download-btn');
+      const hfProgress = document.getElementById('hf-download-progress');
+      const hfBar = document.getElementById('hf-progress-bar');
+      const hfPct = document.getElementById('hf-progress-pct');
+      const hfMsg = document.getElementById('hf-progress-msg');
+      
+      if (hfBtn) {
+        hfBtn.addEventListener('click', async () => {
+          const url = hfUrl.value.trim();
+          if (!url) { toast('Paste a HuggingFace download URL'); return; }
+          
+          hfBtn.disabled = true;
+          hfProgress.style.display = 'block';
+          hfBar.style.width = '0%';
+          hfPct.textContent = '0%';
+          hfMsg.textContent = 'Starting...';
+          hfMsg.style.color = 'var(--muted)';
+          
+          try {
+            const r = await fetch('/api/hf-download', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ url })
+            });
+            const d = await r.json();
+            if (!r.ok || d.error) {
+              hfMsg.textContent = d.error || 'Failed';
+              hfMsg.style.color = 'var(--red)';
+              hfBtn.disabled = false;
+              return;
+            }
+            pollHfDownload(d.job_id, d.type);
+          } catch (e) {
+            hfMsg.textContent = 'Connection error';
+            hfMsg.style.color = 'var(--red)';
+            hfBtn.disabled = false;
+          }
+        });
+      }
+      
+      async function pollHfDownload(jobId, type) {
+        const maxPolls = 1200; // 20 minutes for large models
+        let polls = 0;
+        
+        const poll = async () => {
+          polls++;
+          try {
+            const r = await fetch(`/api/hf-download-status?job_id=${jobId}`);
+            const d = await r.json();
+            
+            hfBar.style.width = (d.progress_pct || 0) + '%';
+            hfPct.textContent = (d.progress_pct || 0) + '%';
+            hfMsg.textContent = d.message || '';
+            
+            if (d.status === 'complete') {
+              hfMsg.textContent = '✓ Download complete! ' + d.filename;
+              hfMsg.style.color = 'var(--green, #4caf50)';
+              hfBtn.disabled = false;
+              // Refresh appropriate model list
+              if (type === 'gguf') await fetchModels();
+              if (type === 'safetensors') await fetchImageModels();
+              return;
+            }
+            if (d.status === 'failed') {
+              hfMsg.textContent = '⚠ ' + (d.error || 'Failed');
+              hfMsg.style.color = 'var(--red)';
+              hfBtn.disabled = false;
+              return;
+            }
+            if (polls < maxPolls) setTimeout(poll, 1000);
+            else {
+              hfMsg.textContent = '⚠ Timeout';
+              hfMsg.style.color = 'var(--red)';
+              hfBtn.disabled = false;
+            }
+          } catch {
+            if (polls < maxPolls) setTimeout(poll, 2000);
+            else {
+              hfMsg.textContent = '⚠ Connection lost';
+              hfMsg.style.color = 'var(--red)';
+              hfBtn.disabled = false;
             }
           }
         };
