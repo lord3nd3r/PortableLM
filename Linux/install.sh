@@ -623,7 +623,7 @@ echo -e "${YLW}[6d/7] Downloading llama.cpp server (optional chat backend)...${R
 
 LLAMA_DIR="$SHARED_BIN/llama-linux"
 LLAMA_BIN="$LLAMA_DIR/llama-server"
-LLAMA_REL="b9444"
+LLAMA_REL="9444"
 
 # Use the same GPU detection as SD: CUDA > ROCm > Vulkan > CPU
 if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then

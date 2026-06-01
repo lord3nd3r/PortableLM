@@ -582,7 +582,7 @@ echo -e "${YLW}[6d/7] Downloading llama.cpp server (optional chat backend)...${R
 
 LLAMA_DIR="$SHARED_BIN/llama-mac"
 LLAMA_BIN="$LLAMA_DIR/llama-server"
-LLAMA_REL="b9444"
+LLAMA_REL="9444"
 
 # macOS: use the arm64 universal build (works on Apple Silicon + Intel via Rosetta)
 LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-macos-arm64.tar.gz"

@@ -681,7 +681,7 @@ Write-Host "[6d/7] Downloading llama.cpp server (optional chat backend)..." -For
 
 $llamaDir = Join-Path $sharedBin "llama-windows"
 $llamaBin = Join-Path $llamaDir "llama-server.exe"
-$llamaRel  = "b9444"
+$llamaRel  = "9444"
 
 # GPU detection: same pattern as SD
 if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
