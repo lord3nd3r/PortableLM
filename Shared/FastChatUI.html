@@ -3946,6 +3946,7 @@
         e.stopPropagation();
         D.sysPanel.classList.toggle('open');
         toggleModelMenu(false);
+        if (D.sysPanel.classList.contains('open')) updateEngineStatus();
       });
       D.logModeSel.addEventListener('change', saveLogMode);
       D.sysSet.addEventListener('click', saveGlobalPrompt);
@@ -3958,7 +3959,9 @@
       const engineSwitchStatus = document.getElementById('engine-switch-status');
       if (chatEngineSel) {
         chatEngineSel.addEventListener('change', () => {
-          if (llamaModelSel) llamaModelSel.style.display = chatEngineSel.value === 'llama' ? 'inline-block' : 'none';
+          const isLlama = chatEngineSel.value === 'llama';
+          if (llamaModelSel) llamaModelSel.style.display = isLlama ? 'inline-block' : 'none';
+          if (isLlama) updateEngineStatus();
         });
       }
       if (applyEngineBtn) {
