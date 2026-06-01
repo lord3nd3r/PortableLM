@@ -589,7 +589,11 @@ else
     curl -L --fail "$SD_ZIP_URL" -o "$SD_ZIP"
     if [ -f "$SD_ZIP" ]; then
         echo -e "      Extracting..."
-        unzip -q "$SD_ZIP" -d "$SD_DIR" 2>/dev/null || true
+        if command -v unzip &>/dev/null; then
+            unzip -q "$SD_ZIP" -d "$SD_DIR" 2>/dev/null || true
+        else
+            python3 -m zipfile -e "$SD_ZIP" "$SD_DIR" 2>/dev/null || true
+        fi
         rm -f "$SD_ZIP"
         # If the archive had a top-level folder, flatten it
         SUBDIR=$(find "$SD_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
