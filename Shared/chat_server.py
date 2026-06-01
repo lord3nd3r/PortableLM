@@ -535,6 +535,25 @@ def _kill_llama():
             break
         time.sleep(0.5)
 
+def _detect_chat_template(model_path):
+    """
+    Infer the correct llama-server --chat-template value from the model filename.
+    Returns None to let llama-server use the template embedded in the GGUF (preferred),
+    or a string override for known models whose GGUFs often lack an embedded template.
+    """
+    name = os.path.basename(model_path).lower()
+    # Llama 2 — uses [INST]/[/INST] with <<SYS>> blocks
+    if "llama-2" in name or "llama2" in name:
+        return "llama2"
+    # Llama 3 — uses <|start_header_id|> format; usually embedded but be safe
+    if "llama-3" in name or "llama3" in name:
+        return "llama3"
+    # Mistral v0.1/v0.2 — [INST] without system slot
+    if "mistral" in name and ("instruct" in name or "chat" in name):
+        return "mistral"
+    # ChatML family (Phi-3, older Qwen, etc.) — usually embedded, skip
+    return None
+
 def _start_llama(model_path):
     """Start llama-server with the given GGUF model path."""
     global _LLAMA_PROC
@@ -558,6 +577,9 @@ def _start_llama(model_path):
             "--n-predict", "-1",
             "--log-disable",
         ]
+        chat_template = _detect_chat_template(model_path)
+        if chat_template:
+            cmd += ["--chat-template", chat_template]
         with _LLAMA_PROC_LOCK:
             _LLAMA_PROC = subprocess.Popen(
                 cmd, env=env,
