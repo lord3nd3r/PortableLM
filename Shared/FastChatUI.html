@@ -3971,10 +3971,22 @@
       const applyEngineBtn = document.getElementById('apply-engine-btn');
       const engineSwitchStatus = document.getElementById('engine-switch-status');
       if (chatEngineSel) {
-        chatEngineSel.addEventListener('change', () => {
+        chatEngineSel.addEventListener('change', async () => {
           const isLlama = chatEngineSel.value === 'llama';
-          if (llamaModelSel) llamaModelSel.style.display = isLlama ? 'inline-block' : 'none';
-          if (isLlama) updateEngineStatus();
+          if (llamaModelSel) {
+            llamaModelSel.style.display = isLlama ? 'inline-block' : 'none';
+            // Populate model list without resetting the dropdown selection
+            if (isLlama && llamaModelSel.options.length <= 1) {
+              try {
+                const r = await fetch('/api/engine-status');
+                const d = await r.json();
+                const models = d.llama_models || [];
+                llamaModelSel.innerHTML = models.length
+                  ? models.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('')
+                  : '<option value="">No .gguf files found</option>';
+              } catch {}
+            }
+          }
         });
       }
       if (applyEngineBtn) {
