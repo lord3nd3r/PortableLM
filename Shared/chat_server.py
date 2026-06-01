@@ -604,6 +604,79 @@ def _detect_chat_template(model_path):
     # ChatML family (Phi-3, older Qwen, etc.) — usually embedded, skip
     return None
 
+def _estimate_tokens(text):
+    """Rough token count estimate: ~4 chars per token for English text."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+def _truncate_messages_to_context(messages, max_tokens=3500, reserve_for_response=500):
+    """
+    Truncate a list of chat messages to fit within context window.
+    
+    Keeps the most recent messages, dropping older ones from the middle.
+    Always preserves: first message (often system/context) and last few exchanges.
+    
+    Args:
+        messages: List of {"role": str, "content": str} dicts
+        max_tokens: Maximum context size (default 3500, leaving room for model overhead)
+        reserve_for_response: Tokens to reserve for model response
+    
+    Returns:
+        Truncated message list, truncation_notice (str or None)
+    """
+    if not messages:
+        return messages, None
+    
+    available = max_tokens - reserve_for_response
+    
+    # Calculate current token usage
+    def msg_tokens(msg):
+        return _estimate_tokens(msg.get("content", "")) + 4  # +4 for role/formatting overhead
+    
+    total_tokens = sum(msg_tokens(m) for m in messages)
+    
+    if total_tokens <= available:
+        return messages, None  # No truncation needed
+    
+    # Strategy: Keep first message (system context) + as many recent messages as fit
+    result = []
+    truncation_notice = None
+    
+    if len(messages) <= 2:
+        # Only 1-2 messages, can't truncate meaningfully
+        return messages, None
+    
+    # Always keep the first message (usually system or important context)
+    first_msg = messages[0]
+    first_tokens = msg_tokens(first_msg)
+    
+    # Build from the end (most recent), tracking tokens
+    recent_messages = []
+    recent_tokens = 0
+    
+    for msg in reversed(messages[1:]):
+        tokens = msg_tokens(msg)
+        if recent_tokens + tokens + first_tokens <= available:
+            recent_messages.insert(0, msg)
+            recent_tokens += tokens
+        else:
+            break
+    
+    # Count how many messages were dropped
+    dropped_count = len(messages) - 1 - len(recent_messages)
+    
+    if dropped_count > 0:
+        result = [first_msg] + recent_messages
+        truncation_notice = f"[{dropped_count} earlier message(s) truncated to fit context window]"
+        
+        # Insert truncation notice as a system message after the first message
+        result.insert(1, {"role": "system", "content": truncation_notice})
+    else:
+        result = [first_msg] + recent_messages
+    
+    return result, truncation_notice
+
 def _start_llama(model_path, job_id=None):
     """Start llama-server with the given GGUF model path.
     
@@ -1849,6 +1922,26 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                         merged_messages[-1]["content"] = (merged_messages[-1]["content"] or "") + "\n" + (msg["content"] or "")
                     else:
                         merged_messages.append(dict(msg))
+
+                # Truncate to fit within context window (llama-server uses 4096 by default)
+                # Reserve tokens for response and template overhead
+                merged_messages, truncation_notice = _truncate_messages_to_context(
+                    merged_messages, max_tokens=3500, reserve_for_response=500
+                )
+                if truncation_notice:
+                    _log_event(logging.INFO, f"Context truncated: {truncation_notice}", request_context=request_context)
+                    # For Gemma, we need to re-fold the truncation notice into user message
+                    if needs_system_fold and len(merged_messages) > 1:
+                        # Find and remove the system truncation notice
+                        for i, msg in enumerate(merged_messages):
+                            if msg.get("role") == "system" and "truncated" in msg.get("content", ""):
+                                notice = merged_messages.pop(i)
+                                # Prepend to first user message
+                                for m in merged_messages:
+                                    if m.get("role") == "user":
+                                        m["content"] = f"[Note: {notice['content']}]\n\n" + (m["content"] or "")
+                                        break
+                                break
 
                 openai_req = {
                     "model": ollama_req.get("model", "local"),
