@@ -1564,6 +1564,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             if active == "llama" and ollama_path == "/api/chat":
                 ollama_req = json.loads(body) if body else {}
                 openai_req = {
+                    "model": ollama_req.get("model", "local"),
                     "messages": ollama_req.get("messages", []),
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
