@@ -1563,15 +1563,39 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             # llama.cpp: translate Ollama /api/chat → OpenAI /v1/chat/completions
             if active == "llama" and ollama_path == "/api/chat":
                 ollama_req = json.loads(body) if body else {}
+                model_name = ollama_req.get("model", "").lower()
+                raw_messages = ollama_req.get("messages", [])
+
+                # Models whose chat templates have no system slot — system content
+                # must be folded into the first user message instead.
+                NO_SYSTEM_SLOT_MODELS = ("gemma",)
+                needs_system_fold = any(m in model_name for m in NO_SYSTEM_SLOT_MODELS)
+
+                if needs_system_fold:
+                    # Collect and strip all system messages, prepend to first user
+                    system_parts = [msg["content"] for msg in raw_messages if msg.get("role") == "system" and msg.get("content")]
+                    non_system = [dict(msg) for msg in raw_messages if msg.get("role") != "system"]
+                    if system_parts:
+                        system_text = "\n\n".join(system_parts)
+                        # Find first user message to prepend into
+                        for msg in non_system:
+                            if msg.get("role") == "user":
+                                msg["content"] = system_text + "\n\n" + (msg["content"] or "")
+                                break
+                        else:
+                            # No user message exists yet — insert one
+                            non_system.insert(0, {"role": "user", "content": system_text})
+                    raw_messages = non_system
+
                 # Merge consecutive same-role messages — gemma (and many other models)
                 # require strict user/assistant alternation in their chat templates.
-                raw_messages = ollama_req.get("messages", [])
                 merged_messages = []
                 for msg in raw_messages:
                     if merged_messages and merged_messages[-1]["role"] == msg["role"]:
                         merged_messages[-1]["content"] = (merged_messages[-1]["content"] or "") + "\n" + (msg["content"] or "")
                     else:
                         merged_messages.append(dict(msg))
+
                 openai_req = {
                     "model": ollama_req.get("model", "local"),
                     "messages": merged_messages,
