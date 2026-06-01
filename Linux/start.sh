@@ -28,46 +28,63 @@ mkdir -p "$OLLAMA_RUNTIME/runners" "$OLLAMA_RUNTIME/tmp"
 # -------------------------------------------------------
 
 PORTABLE_OLLAMA="$SHARED_DIR/bin/ollama-linux"
+PORTABLE_LLAMA="$SHARED_DIR/bin/llama-linux/llama-server"
+SETTINGS_FILE="$SHARED_DIR/chat_data/settings.json"
 OLLAMA_PID=""
 
-# Check if Ollama is already running (system or previously started)
-if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
-    echo "[OK] Ollama is already running - using existing instance."
-elif [ -f "$PORTABLE_OLLAMA" ]; then
-    # Start the portable engine bundled on the USB
-    echo "Starting portable AI engine..."
-    HOME="$OLLAMA_RUNTIME" "$PORTABLE_OLLAMA" serve &
-    OLLAMA_PID=$!
-    echo "Waiting for engine to initialize..."
-    until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
-        sleep 1
-    done
-    echo "[OK] Engine is online!"
-elif command -v ollama > /dev/null 2>&1; then
-    # Fall back to system-installed Ollama
-    echo "Portable engine not found - starting system Ollama..."
-    ollama serve &
-    OLLAMA_PID=$!
-    echo "Waiting for engine to initialize..."
-    until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
-        sleep 1
-    done
-    echo "[OK] System Ollama is online!"
+# Read chatEngine setting (default: ollama)
+CHAT_ENGINE="ollama"
+if command -v python3 >/dev/null 2>&1 && [ -f "$SETTINGS_FILE" ]; then
+    CHAT_ENGINE=$(python3 -c "import json,sys; d=json.load(open('$SETTINGS_FILE')); print(d.get('chatEngine','ollama'))" 2>/dev/null || echo "ollama")
+fi
+
+if [ "$CHAT_ENGINE" = "llama" ] && [ -f "$PORTABLE_LLAMA" ]; then
+    # llama.cpp mode: the chat_server.py will start llama-server itself on demand.
+    # We just need to make the binary executable and skip Ollama.
+    chmod +x "$PORTABLE_LLAMA" 2>/dev/null
+    echo "[OK] Chat backend: llama.cpp (managed by chat server)"
 else
-    echo "==================================================="
-    echo "  ERROR: No Ollama engine found!"
-    echo "==================================================="
-    echo ""
-    echo "  No Ollama engine is running and none was found on"
-    echo "  this system. To fix this, either:"
-    echo "    1. Run 'bash Linux/install.sh' to download the"
-    echo "       portable engine, OR"
-    echo "    2. Install Ollama system-wide from https://ollama.com"
-    echo "       and make sure it is running before starting."
-    echo ""
-    read -n 1 -s -r -p "Press any key to exit..."
-    echo ""
-    exit 1
+    # Ollama mode (default)
+    CHAT_ENGINE="ollama"
+    # Check if Ollama is already running (system or previously started)
+    if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
+        echo "[OK] Ollama is already running - using existing instance."
+    elif [ -f "$PORTABLE_OLLAMA" ]; then
+        # Start the portable engine bundled on the USB
+        echo "Starting portable AI engine..."
+        HOME="$OLLAMA_RUNTIME" "$PORTABLE_OLLAMA" serve &
+        OLLAMA_PID=$!
+        echo "Waiting for engine to initialize..."
+        until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
+            sleep 1
+        done
+        echo "[OK] Engine is online!"
+    elif command -v ollama > /dev/null 2>&1; then
+        # Fall back to system-installed Ollama
+        echo "Portable engine not found - starting system Ollama..."
+        ollama serve &
+        OLLAMA_PID=$!
+        echo "Waiting for engine to initialize..."
+        until curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
+            sleep 1
+        done
+        echo "[OK] System Ollama is online!"
+    else
+        echo "==================================================="
+        echo "  ERROR: No Ollama engine found!"
+        echo "==================================================="
+        echo ""
+        echo "  No Ollama engine is running and none was found on"
+        echo "  this system. To fix this, either:"
+        echo "    1. Run 'bash Linux/install.sh' to download the"
+        echo "       portable engine, OR"
+        echo "    2. Install Ollama system-wide from https://ollama.com"
+        echo "       and make sure it is running before starting."
+        echo ""
+        read -n 1 -s -r -p "Press any key to exit..."
+        echo ""
+        exit 1
+    fi
 fi
 
 echo ""

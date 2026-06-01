@@ -575,6 +575,57 @@ else
 fi
 
 # ================================================================
+# STEP 6d: Download llama.cpp server (llama-server)
+# ================================================================
+echo ""
+echo -e "${YLW}[6d/7] Downloading llama.cpp server (optional chat backend)...${RST}"
+
+LLAMA_DIR="$SHARED_BIN/llama-mac"
+LLAMA_BIN="$LLAMA_DIR/llama-server"
+LLAMA_REL="b9444"
+
+# macOS: use the arm64 universal build (works on Apple Silicon + Intel via Rosetta)
+LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-macos-arm64.tar.gz"
+
+is_macho() {
+    local path=$1
+    [ -f "$path" ] || return 1
+    local magic
+    magic=$(head -c 4 "$path" 2>/dev/null | xxd -p 2>/dev/null | tr -d ' \n' | head -c 8)
+    [[ "$magic" == "cffaedfe" || "$magic" == "cafebabe" || "$magic" == "feedface" ]]
+}
+
+if [ -f "$LLAMA_BIN" ] && file_ok "$LLAMA_BIN" 1000000; then
+    echo -e "${GRN}      llama-server already installed! Skipping...${RST}"
+else
+    mkdir -p "$LLAMA_DIR"
+    LLAMA_TMP="$SHARED_BIN/llama-mac.tar.gz"
+    echo -e "      Downloading llama-server for macOS..."
+    curl -L --fail "$LLAMA_ARCHIVE_URL" -o "$LLAMA_TMP"
+    if [ -f "$LLAMA_TMP" ]; then
+        echo -e "      Extracting..."
+        tar -xzf "$LLAMA_TMP" -C "$LLAMA_DIR" --strip-components=1 2>/dev/null || \
+            tar -xzf "$LLAMA_TMP" -C "$LLAMA_DIR" 2>/dev/null || true
+        rm -f "$LLAMA_TMP"
+        LSUB=$(find "$LLAMA_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+        if [ -n "$LSUB" ]; then
+            mv "$LSUB"/* "$LLAMA_DIR"/ 2>/dev/null || true
+            rmdir "$LSUB" 2>/dev/null || true
+        fi
+        if [ -f "$LLAMA_DIR/llama-server" ] && file_ok "$LLAMA_DIR/llama-server" 1000000; then
+            chmod +x "$LLAMA_DIR/llama-server"
+            # Remove quarantine on macOS
+            xattr -d com.apple.quarantine "$LLAMA_DIR/llama-server" 2>/dev/null || true
+            echo -e "${GRN}      llama-server installed!${RST}"
+        else
+            echo -e "${YLW}      WARNING: llama-server binary not found after extraction.${RST}"
+        fi
+    else
+        echo -e "${YLW}      WARNING: llama-server download failed. The app will use Ollama by default.${RST}"
+    fi
+fi
+
+# ================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # ================================================================
 echo ""

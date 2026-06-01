@@ -78,9 +78,22 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────
 CHAT_SERVER_PORT = 3333
 OLLAMA_HOST = "http://127.0.0.1:11434"
-LLAMA_CPP_MODE = "--llama-cpp" in sys.argv
-if LLAMA_CPP_MODE:
-    OLLAMA_HOST = "http://127.0.0.1:8080"
+LLAMA_HOST   = "http://127.0.0.1:8080"
+
+# Active engine is loaded from settings after SETTINGS_FILE is defined.
+# Default here; overwritten in main() once settings are read.
+ACTIVE_ENGINE = "ollama"   # "ollama" | "llama"
+ACTIVE_ENGINE_LOCK = threading.RLock()
+
+def _get_chat_host():
+    """Return the base URL for the active chat engine."""
+    with ACTIVE_ENGINE_LOCK:
+        return LLAMA_HOST if ACTIVE_ENGINE == "llama" else OLLAMA_HOST
+
+def _set_active_engine(engine):
+    global ACTIVE_ENGINE
+    with ACTIVE_ENGINE_LOCK:
+        ACTIVE_ENGINE = engine if engine in ("ollama", "llama") else "ollama"
 
 # Always resolve paths relative to THIS script's location (the USB drive)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -188,6 +201,48 @@ elif platform.system() == "Linux":
     OLLAMA_BIN = os.path.join(SCRIPT_DIR, "bin", "ollama-linux")
 else:
     OLLAMA_BIN = os.path.join(SCRIPT_DIR, "bin", "ollama-darwin")
+
+# llama.cpp server binary
+def _find_llama_bin():
+    """Locate the llama-server binary for this platform."""
+    plat = platform.system()
+    bin_dir = os.path.join(SCRIPT_DIR, "bin")
+    if plat == "Windows":
+        candidates = [
+            os.path.join(bin_dir, "llama-windows", "llama-server.exe"),
+        ]
+    elif plat == "Linux":
+        candidates = [
+            os.path.join(bin_dir, "llama-linux", "llama-server"),
+        ]
+    else:
+        candidates = [
+            os.path.join(bin_dir, "llama-mac", "llama-server"),
+        ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+LLAMA_BIN = _find_llama_bin()
+
+def _find_gguf_models():
+    """Return list of dicts for every .gguf file in the models folder."""
+    models_dir = os.path.join(SCRIPT_DIR, "models")
+    found = []
+    if os.path.isdir(models_dir):
+        for fname in sorted(os.listdir(models_dir)):
+            if fname.lower().endswith(".gguf"):
+                found.append({
+                    "file": fname,
+                    "path": os.path.join(models_dir, fname),
+                    "name": os.path.splitext(fname)[0].replace("_", " ").replace("-", " "),
+                })
+    return found
+
+# Track the llama-server subprocess so we can kill it cleanly
+_LLAMA_PROC = None
+_LLAMA_PROC_LOCK = threading.RLock()
 
 CHATS_DIR = os.path.join(SCRIPT_DIR, "chat_data")
 CHATS_FILE = os.path.join(CHATS_DIR, "chats.json")
@@ -335,6 +390,8 @@ def _load_settings_file():
         "globalSystemPrompt": "",
         "temperature": 0.7,
         "logMode": DEFAULT_LOG_MODE,
+        "chatEngine": "ollama",
+        "llamaModel": "",
     }
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -438,6 +495,80 @@ def _is_ollama_running():
         req = urllib.request.Request(OLLAMA_HOST + "/api/tags", method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
             return resp.status == 200
+    except Exception:
+        return False
+
+def _is_llama_running():
+    """Check if llama-server responds on its default port."""
+    try:
+        req = urllib.request.Request(LLAMA_HOST + "/health", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+def _kill_llama():
+    """Stop any running llama-server process."""
+    global _LLAMA_PROC
+    plat = platform.system()
+    with _LLAMA_PROC_LOCK:
+        if _LLAMA_PROC is not None:
+            try:
+                _LLAMA_PROC.terminate()
+                _LLAMA_PROC.wait(timeout=5)
+            except Exception:
+                try:
+                    _LLAMA_PROC.kill()
+                except Exception:
+                    pass
+            _LLAMA_PROC = None
+    # Also kill any stray processes
+    try:
+        if plat == "Windows":
+            subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], capture_output=True)
+        else:
+            subprocess.run(["pkill", "-f", "llama-server"], capture_output=True)
+    except Exception:
+        pass
+    for _ in range(10):
+        if not _is_llama_running():
+            break
+        time.sleep(0.5)
+
+def _start_llama(model_path):
+    """Start llama-server with the given GGUF model path."""
+    global _LLAMA_PROC
+    if not LLAMA_BIN or not os.path.isfile(LLAMA_BIN):
+        return False
+    if not model_path or not os.path.isfile(model_path):
+        return False
+    try:
+        bin_dir = os.path.dirname(os.path.abspath(LLAMA_BIN))
+        env = os.environ.copy()
+        # Add binary dir to library path for bundled .so/.dll files
+        if platform.system() == "Linux":
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = bin_dir + (":" + existing if existing else "")
+        cmd = [
+            LLAMA_BIN,
+            "--model", model_path,
+            "--host", "127.0.0.1",
+            "--port", "8080",
+            "--ctx-size", "4096",
+            "--n-predict", "-1",
+            "--log-disable",
+        ]
+        with _LLAMA_PROC_LOCK:
+            _LLAMA_PROC = subprocess.Popen(
+                cmd, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        # Wait for it to be ready
+        for _ in range(60):
+            if _is_llama_running():
+                return True
+            time.sleep(1)
+        return False
     except Exception:
         return False
 
@@ -886,6 +1017,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/engine-status":
             self._get_engine_status()
 
+        # Chat models API (engine-aware)
+        elif path == "/api/chat-models":
+            self._get_chat_models()
+
         # Image model info API
         elif path == "/api/image-models":
             self._get_image_models()
@@ -921,6 +1056,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/api/start-ollama":
             self._start_ollama_endpoint()
+
+        elif path == "/api/switch-engine":
+            self._switch_engine_endpoint()
 
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
@@ -1118,9 +1256,16 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def _get_engine_status(self):
         """Return which engines are currently running."""
         ollama_up = _is_ollama_running()
+        llama_up = _is_llama_running()
         current_models = _find_sd_models()
+        with ACTIVE_ENGINE_LOCK:
+            active = ACTIVE_ENGINE
         data = json.dumps({
             "ollama": ollama_up,
+            "llama": llama_up,
+            "active_engine": active,
+            "llama_available": bool(LLAMA_BIN and os.path.isfile(LLAMA_BIN)),
+            "llama_models": [m["file"] for m in _find_gguf_models()],
             "sd_enabled": SD_BINARY is not None and len(current_models) > 0,
             "sd_binary": bool(SD_BINARY),
             "sd_model": len(current_models) > 0,
@@ -1134,7 +1279,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data.encode())
 
     def _stop_ollama_endpoint(self):
-        """Stop the Ollama chat engine to free RAM for image generation."""
         request_context = self._build_request_context("/api/stop-ollama")
         try:
             _kill_ollama()
@@ -1146,6 +1290,103 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"ok": True, "message": "Chat engine stopped."}).encode())
         except Exception as e:
             _log_event(logging.ERROR, "Failed to stop Ollama", request_context=request_context, exc_info=True)
+            self.send_response(500)
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+    def _get_chat_models(self):
+        """Return chat models for the active engine."""
+        with ACTIVE_ENGINE_LOCK:
+            active = ACTIVE_ENGINE
+        if active == "llama":
+            models = []
+            for m in _find_gguf_models():
+                size_str = ""
+                try:
+                    size_str = f"{os.path.getsize(m['path']) / 1073741824:.1f} GB"
+                except Exception:
+                    pass
+                models.append({"name": m["name"], "file": m["file"], "size": size_str})
+            data = json.dumps({"engine": "llama", "models": models})
+        else:
+            # Proxy Ollama tags and reformat
+            try:
+                req = urllib.request.Request(OLLAMA_HOST + "/api/tags", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    raw = json.loads(resp.read())
+                models = [{"name": m["name"], "file": "",
+                           "size": f"{m.get('size', 0) / 1073741824:.1f} GB"}
+                          for m in raw.get("models", [])]
+            except Exception:
+                models = []
+            data = json.dumps({"engine": "ollama", "models": models})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(data.encode())
+
+    def _switch_engine_endpoint(self):
+        """Kill the current chat engine and start the requested one."""
+        request_context = self._build_request_context("/api/switch-engine")
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+
+        engine = payload.get("engine", "ollama")
+        if engine not in ("ollama", "llama"):
+            self.send_response(400)
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "engine must be 'ollama' or 'llama'"}).encode())
+            return
+
+        try:
+            if engine == "llama":
+                model_file = os.path.basename(payload.get("model", ""))
+                if not model_file:
+                    gguf = _find_gguf_models()
+                    if not gguf:
+                        raise RuntimeError("No .gguf model found in models folder.")
+                    model_file = gguf[0]["file"]
+                model_path = os.path.join(SCRIPT_DIR, "models", model_file)
+                if not os.path.isfile(model_path) or not model_path.lower().endswith(".gguf"):
+                    raise RuntimeError(f"Model '{model_file}' not found.")
+
+                # Stop Ollama, start llama-server
+                _kill_ollama()
+                _kill_llama()
+                ok = _start_llama(model_path)
+                if not ok:
+                    raise RuntimeError("llama-server failed to start. Check that the engine is installed.")
+                _set_active_engine("llama")
+            else:
+                # Stop llama-server, start Ollama
+                _kill_llama()
+                if not _is_ollama_running():
+                    ok = _start_ollama()
+                    if not ok:
+                        raise RuntimeError("Ollama failed to start.")
+                _set_active_engine("ollama")
+                model_file = ""
+
+            # Persist the choice
+            settings = _load_settings_file()
+            settings["chatEngine"] = engine
+            settings["llamaModel"] = model_file if engine == "llama" else settings.get("llamaModel", "")
+            _persist_settings_file(settings)
+
+            _log_event(logging.INFO, f"Chat engine switched to '{engine}'", request_context=request_context)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "engine": engine}).encode())
+        except Exception as e:
+            _log_event(logging.ERROR, "Engine switch failed", request_context=request_context, exc_info=True)
             self.send_response(500)
             self._cors_headers()
             self.end_headers()
@@ -1277,16 +1518,18 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(resp).encode())
 
-    # ── Ollama Proxy (streaming-aware) ─────────────────────────
+    # ── Ollama/llama.cpp Proxy (streaming-aware) ──────────────────────────────
     def _proxy_ollama(self, method):
         """
-        Proxy requests from /ollama/* to the local Ollama engine.
-        Supports streaming responses for /api/chat and /api/generate.
+        Proxy requests from /ollama/* to the active chat engine.
+        Transparently translates Ollama API ↔ OpenAI API when llama.cpp is active.
         """
         request_context = self._build_request_context("/ollama")
-        # Strip the /ollama prefix to get the real Ollama path
         ollama_path = self.path[len("/ollama"):]
-        target_url = OLLAMA_HOST + ollama_path
+        with ACTIVE_ENGINE_LOCK:
+            active = ACTIVE_ENGINE
+        chat_host = _get_chat_host()
+        target_url = chat_host + ollama_path
 
         # Read request body if present
         body = None
@@ -1306,24 +1549,26 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             request_context["model_temperature"] = payload.get("options", {}).get("temperature", "-")
 
         try:
-            # Handle fake /api/tags for llama.cpp mode
-            if LLAMA_CPP_MODE and ollama_path == "/api/tags":
+            # llama.cpp: synthesise /api/tags from local .gguf files
+            if active == "llama" and ollama_path == "/api/tags":
+                gguf_models = _find_gguf_models()
+                models = [{"name": m["name"], "model": m["name"], "size": 0} for m in gguf_models]
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self._cors_headers()
                 self.end_headers()
-                self.wfile.write(json.dumps({"models":[{"name": "local-llama-model"}]}).encode())
+                self.wfile.write(json.dumps({"models": models}).encode())
                 return
 
-            if LLAMA_CPP_MODE and ollama_path == "/api/chat":
-                # Translate Ollama payload -> OpenAI payload for llama-server
+            # llama.cpp: translate Ollama /api/chat → OpenAI /v1/chat/completions
+            if active == "llama" and ollama_path == "/api/chat":
                 ollama_req = json.loads(body) if body else {}
                 openai_req = {
                     "messages": ollama_req.get("messages", []),
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
                 }
-                target_url = OLLAMA_HOST + "/v1/chat/completions"
+                target_url = chat_host + "/v1/chat/completions"
                 body = json.dumps(openai_req).encode()
 
             req = urllib.request.Request(
@@ -1362,9 +1607,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 chunk = response.read(4096)
                 if not chunk:
                     break
-                
+
                 # If bridging llama.cpp SSE to Ollama JSONL
-                if LLAMA_CPP_MODE and is_stream:
+                if active == "llama" and is_stream:
                     text = chunk.decode(errors="ignore")
                     lines = text.split("\n")
                     for line in lines:
@@ -1473,8 +1718,22 @@ def open_browser_delayed():
 
 def main():
     ensure_data_dir()
-    _set_active_log_mode(_load_settings_file().get("logMode"))
-    
+    startup_settings = _load_settings_file()
+    _set_active_log_mode(startup_settings.get("logMode"))
+
+    # Restore chat engine from saved settings
+    saved_engine = startup_settings.get("chatEngine", "ollama")
+    _set_active_engine(saved_engine)
+    if ACTIVE_ENGINE == "llama":
+        model_file = startup_settings.get("llamaModel", "")
+        if not model_file:
+            gguf_list = _find_gguf_models()
+            if gguf_list:
+                model_file = gguf_list[0]["file"]
+        if model_file:
+            model_path = os.path.join(SCRIPT_DIR, "models", model_file)
+            _start_llama(model_path)
+
     # Try to find the local LAN IP
     local_ip = "127.0.0.1"
     try:
@@ -1493,9 +1752,7 @@ def main():
     print()
     print(f"  Local Access:    http://localhost:{CHAT_SERVER_PORT}")
     print(f"  Network Access:  http://{local_ip}:{CHAT_SERVER_PORT}   <-- Use this on phone/other PC!")
-    print(f"  Ollama/Llama Proxy: {OLLAMA_HOST}")
-    if LLAMA_CPP_MODE:
-        print("  Running in LLAMA_CPP_MODE (Translating API requests)")
+    print(f"  Chat Engine:     {ACTIVE_ENGINE.upper()} ({_get_chat_host()})")
     print()
     print("  All chats auto-save to the USB drive!")
     print("  Press Ctrl+C to shut down.")

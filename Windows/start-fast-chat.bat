@@ -65,9 +65,24 @@ if exist "%~dp0..\Shared\python\python.exe" (
 )
 
 :: -------------------------------------------------------
-:: Start Ollama Engine
+:: Check chat engine setting
 :: -------------------------------------------------------
 :PythonReady
+
+set "CHAT_ENGINE=ollama"
+set "SETTINGS_FILE=%~dp0..\Shared\chat_data\settings.json"
+if exist "%SETTINGS_FILE%" (
+    for /f "usebackq delims=" %%E in (`%PYTHON_CMD% -c "import json; d=json.load(open(r'%SETTINGS_FILE%')); print(d.get('chatEngine','ollama'))" 2^>nul`) do set "CHAT_ENGINE=%%E"
+)
+
+if "%CHAT_ENGINE%"=="llama" (
+    if exist "%~dp0..\Shared\bin\llama-windows\llama-server.exe" (
+        echo [OK] Chat backend: llama.cpp ^(managed by chat server^)
+        goto :StartChat
+    )
+    echo [WARN] llama.cpp selected but llama-server.exe not found. Falling back to Ollama.
+    set "CHAT_ENGINE=ollama"
+)
 
 :: Check if Ollama is already running
 curl -s http://127.0.0.1:11434/api/tags >nul 2>&1

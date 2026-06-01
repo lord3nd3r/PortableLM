@@ -674,6 +674,61 @@ if (Test-Path "$SDDir\sd.exe") {
 }
 
 # =================================================================
+# STEP 6d: Download llama.cpp server (llama-server)
+# =================================================================
+Write-Host ""
+Write-Host "[6d/7] Downloading llama.cpp server (optional chat backend)..." -ForegroundColor Yellow
+
+$llamaDir = Join-Path $sharedBin "llama-windows"
+$llamaBin = Join-Path $llamaDir "llama-server.exe"
+$llamaRel  = "b9444"
+
+# GPU detection: same pattern as SD
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    $llamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b$llamaRel/llama-b$llamaRel-bin-win-cuda-12.4-x64.zip"
+    Write-Host "      NVIDIA GPU detected — using CUDA build" -ForegroundColor Cyan
+} elseif (Get-Command rocm-smi -ErrorAction SilentlyContinue) {
+    $llamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b$llamaRel/llama-b$llamaRel-bin-win-vulkan-x64.zip"
+    Write-Host "      AMD GPU detected — using Vulkan build (ROCm not available for Windows llama.cpp)" -ForegroundColor Cyan
+} else {
+    # Try Vulkan
+    $vkInfo = & vulkaninfo --summary 2>&1
+    if ($LASTEXITCODE -eq 0 -and $vkInfo -notmatch "ERROR") {
+        $llamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b$llamaRel/llama-b$llamaRel-bin-win-vulkan-x64.zip"
+        Write-Host "      Vulkan GPU detected — using Vulkan build" -ForegroundColor Cyan
+    } else {
+        $llamaUrl = "https://github.com/ggml-org/llama.cpp/releases/download/b$llamaRel/llama-b$llamaRel-bin-win-cpu-x64.zip"
+        Write-Host "      No GPU detected — using CPU build" -ForegroundColor Gray
+    }
+}
+
+if ((Test-Path $llamaBin) -and ((Get-Item $llamaBin).Length -gt 1MB)) {
+    Write-Host "      llama-server already installed! Skipping..." -ForegroundColor Green
+} else {
+    New-Item -ItemType Directory -Force -Path $llamaDir | Out-Null
+    $llamaZip = Join-Path $sharedBin "llama-windows.zip"
+    Write-Host "      Downloading llama-server..."
+    try {
+        Invoke-WebRequest -Uri $llamaUrl -OutFile $llamaZip -UseBasicParsing
+        Expand-Archive -Path $llamaZip -DestinationPath $llamaDir -Force
+        Remove-Item $llamaZip -Force -ErrorAction SilentlyContinue
+        # Flatten subdirectory if present
+        $lsub = Get-ChildItem $llamaDir -Directory | Select-Object -First 1
+        if ($lsub) {
+            Get-ChildItem $lsub.FullName | Move-Item -Destination $llamaDir -Force -ErrorAction SilentlyContinue
+            Remove-Item $lsub.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $llamaBin) {
+            Write-Host "      llama-server installed!" -ForegroundColor Green
+        } else {
+            Write-Host "      WARNING: llama-server.exe not found after extraction." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "      WARNING: llama-server download failed. App will use Ollama by default." -ForegroundColor Yellow
+    }
+}
+
+# =================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # =================================================================
 Write-Host ""

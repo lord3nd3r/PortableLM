@@ -616,6 +616,60 @@ else
 fi
 
 # ================================================================
+# STEP 6d: Download llama.cpp server (llama-server)
+# ================================================================
+echo ""
+echo -e "${YLW}[6d/7] Downloading llama.cpp server (optional chat backend)...${RST}"
+
+LLAMA_DIR="$SHARED_BIN/llama-linux"
+LLAMA_BIN="$LLAMA_DIR/llama-server"
+LLAMA_REL="b9444"
+
+# Use the same GPU detection as SD: CUDA > ROCm > Vulkan > CPU
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-ubuntu-x64.tar.gz"
+    echo -e "      NVIDIA GPU detected — using CUDA-capable build"
+elif command -v rocm-smi &>/dev/null && rocm-smi &>/dev/null 2>&1; then
+    LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-ubuntu-rocm-7.2-x64.tar.gz"
+    echo -e "      AMD ROCm GPU detected — using ROCm build"
+elif command -v vulkaninfo &>/dev/null && vulkaninfo --summary &>/dev/null 2>&1; then
+    LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-ubuntu-vulkan-x64.tar.gz"
+    echo -e "      Vulkan GPU detected — using Vulkan build"
+else
+    LLAMA_ARCHIVE_URL="https://github.com/ggml-org/llama.cpp/releases/download/b${LLAMA_REL}/llama-b${LLAMA_REL}-bin-ubuntu-x64.tar.gz"
+    echo -e "      No GPU detected — using CPU build"
+fi
+
+if [ -f "$LLAMA_BIN" ] && is_elf "$LLAMA_BIN" && file_ok "$LLAMA_BIN" 1000000; then
+    echo -e "${GRN}      llama-server already installed! Skipping...${RST}"
+else
+    mkdir -p "$LLAMA_DIR"
+    LLAMA_TMP="$SHARED_BIN/llama-linux.tar.gz"
+    echo -e "      Downloading llama-server..."
+    curl -L --fail "$LLAMA_ARCHIVE_URL" -o "$LLAMA_TMP"
+    if [ -f "$LLAMA_TMP" ]; then
+        echo -e "      Extracting..."
+        tar -xzf "$LLAMA_TMP" -C "$LLAMA_DIR" --strip-components=1 2>/dev/null || \
+            tar -xzf "$LLAMA_TMP" -C "$LLAMA_DIR" 2>/dev/null || true
+        rm -f "$LLAMA_TMP"
+        # Flatten any subdirectory
+        LSUB=$(find "$LLAMA_DIR" -maxdepth 1 -mindepth 1 -type d | head -n 1)
+        if [ -n "$LSUB" ]; then
+            mv "$LSUB"/* "$LLAMA_DIR"/ 2>/dev/null || true
+            rmdir "$LSUB" 2>/dev/null || true
+        fi
+        if [ -f "$LLAMA_DIR/llama-server" ] && is_elf "$LLAMA_DIR/llama-server"; then
+            chmod +x "$LLAMA_DIR/llama-server"
+            echo -e "${GRN}      llama-server installed!${RST}"
+        else
+            echo -e "${YLW}      WARNING: llama-server binary not found after extraction. You can add it manually later.${RST}"
+        fi
+    else
+        echo -e "${YLW}      WARNING: llama-server download failed. The app will use Ollama by default.${RST}"
+    fi
+fi
+
+# ================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # ================================================================
 echo ""

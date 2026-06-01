@@ -2253,6 +2253,21 @@
             <span class="sys-hint">Saved per device. Reduce disk writes by using errors only.</span>
           </div>
         </div>
+        <hr class="sys-divider" />
+        <div class="sys-row">
+          <label>Chat Backend</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+            <select id="chat-engine-select" class="sys-select">
+              <option value="ollama">Ollama (default)</option>
+              <option value="llama">llama.cpp</option>
+            </select>
+            <select id="llama-model-select" class="sys-select" style="display:none">
+              <option value="">-- select model --</option>
+            </select>
+            <button class="sys-btn primary" id="apply-engine-btn">Apply</button>
+            <span class="sys-hint" id="engine-switch-status" style="align-self:center;"></span>
+          </div>
+        </div>
       </div>
 
         <!-- Chat / Messages -->
@@ -2815,10 +2830,11 @@
 
       async function fetchModels() {
         try {
-          const r = await fetch(OLLAMA + '/api/tags');
+          const r = await fetch('/api/chat-models');
           if (!r.ok) throw new Error();
           const d = await r.json();
-          S.models = d.models || [];
+          // Normalize to the shape the rest of the UI expects: {name, model}
+          S.models = (d.models || []).map(m => ({ name: m.name, model: m.name, size: m.size || 0 }));
           renderModelMenu();
           if (
             S.models.length &&
@@ -2880,6 +2896,7 @@
           const ollamaUp = d.ollama;
           const sdReady = d.sd_enabled;
           const sdHealthy = d.sd_healthy;
+          const activeEngine = d.active_engine || 'ollama';
 
           // Image engine row
           if (!sdReady) {
@@ -2902,9 +2919,9 @@
           }
 
           // Chat engine row
-          if (ollamaUp) {
+          if (ollamaUp || (activeEngine === 'llama' && d.llama)) {
             D.chatEngineDot.className = 'img-engine-dot on';
-            D.chatEngineStatus.textContent = 'Running';
+            D.chatEngineStatus.textContent = activeEngine === 'llama' ? 'Running (llama.cpp)' : 'Running';
             D.imgStopOllama.style.display = 'inline-block';
             D.imgStartOllama.style.display = 'none';
             D.imgGenBtn.disabled = true;
@@ -2915,6 +2932,21 @@
             D.imgStartOllama.style.display = 'inline-block';
             if (sdReady && sdHealthy) {
               D.imgGenBtn.disabled = false;
+            }
+          }
+
+          // Backend switcher state
+          const engSel = document.getElementById('chat-engine-select');
+          const llamaSel = document.getElementById('llama-model-select');
+          if (engSel) {
+            engSel.value = activeEngine;
+            // Populate llama model list
+            const llamaModels = d.llama_models || [];
+            if (llamaSel) {
+              llamaSel.innerHTML = llamaModels.length
+                ? llamaModels.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('')
+                : '<option value="">No .gguf files found</option>';
+              llamaSel.style.display = activeEngine === 'llama' ? 'inline-block' : 'none';
             }
           }
         } catch {
@@ -3918,6 +3950,45 @@
       D.logModeSel.addEventListener('change', saveLogMode);
       D.sysSet.addEventListener('click', saveGlobalPrompt);
       D.sysClr.addEventListener('click', clearGlobalPrompt);
+
+      // Chat backend switcher
+      const chatEngineSel = document.getElementById('chat-engine-select');
+      const llamaModelSel = document.getElementById('llama-model-select');
+      const applyEngineBtn = document.getElementById('apply-engine-btn');
+      const engineSwitchStatus = document.getElementById('engine-switch-status');
+      if (chatEngineSel) {
+        chatEngineSel.addEventListener('change', () => {
+          if (llamaModelSel) llamaModelSel.style.display = chatEngineSel.value === 'llama' ? 'inline-block' : 'none';
+        });
+      }
+      if (applyEngineBtn) {
+        applyEngineBtn.addEventListener('click', async () => {
+          const engine = chatEngineSel ? chatEngineSel.value : 'ollama';
+          const model = (engine === 'llama' && llamaModelSel) ? llamaModelSel.value : '';
+          applyEngineBtn.disabled = true;
+          if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Switching…'; engineSwitchStatus.style.color = 'var(--accent)'; }
+          try {
+            const r = await fetch('/api/switch-engine', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ engine, model })
+            });
+            const d = await r.json();
+            if (d.ok) {
+              if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Done ✓'; engineSwitchStatus.style.color = 'var(--green, #4caf50)'; }
+              await fetchModels();
+              await updateEngineStatus();
+            } else {
+              if (engineSwitchStatus) { engineSwitchStatus.textContent = d.error || 'Failed'; engineSwitchStatus.style.color = 'var(--red)'; }
+            }
+          } catch {
+            if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Error'; engineSwitchStatus.style.color = 'var(--red)'; }
+          } finally {
+            applyEngineBtn.disabled = false;
+            setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 4000);
+          }
+        });
+      }
 
         // Image generation bindings
         D.imgGenBtn.addEventListener('click', generateImage);
