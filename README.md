@@ -64,6 +64,9 @@ PortableLM supports two chat engines, switchable at runtime from the ⚙ setting
 
 The selected backend and model are persisted across restarts. The install script downloads both engine binaries automatically, selecting the best GPU build for your hardware (CUDA / ROCm / Vulkan / CPU).
 
+- **Image generation works simultaneously with llama.cpp** — both run independently. Image gen is only blocked when Ollama is active (shared RAM).
+- **llama.cpp auto-selects a free port** — no conflicts if port 8080 is already in use on your system.
+
 ---
 
 ## Quick Start
@@ -165,6 +168,9 @@ Use your PC's AI from your phone on the couch:
 | Slow generation | Model too large for your RAM. Use the Gemma 2 2B model. |
 | Chat error with llama.cpp | Ensure a `.gguf` file is selected in the settings panel before chatting. |
 | llama.cpp returns 400 | Usually a model mismatch. Re-select the model in settings and click Apply. |
+| llama.cpp option reverts to Ollama | The engine takes up to 60 seconds to load on CPU-only machines. Wait for it — the selection is saved immediately and will survive a restart. |
+| "llama-server failed to start" | Port 8080 conflict or missing binary. Run `bash Linux/install.sh` again to re-download the engine. |
+| SD image gen button greyed out with llama.cpp | Update to the latest version — image gen now works alongside llama.cpp. |
 
 ---
 
