@@ -4000,7 +4000,8 @@
           const engine = chatEngineSel ? chatEngineSel.value : 'ollama';
           const model = (engine === 'llama' && llamaModelSel) ? llamaModelSel.value : '';
           applyEngineBtn.disabled = true;
-          if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Switching…'; engineSwitchStatus.style.color = 'var(--accent)'; }
+          if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Starting…'; engineSwitchStatus.style.color = 'var(--accent)'; }
+          
           try {
             const r = await fetch('/api/switch-engine', {
               method: 'POST',
@@ -4008,23 +4009,97 @@
               body: JSON.stringify({ engine, model })
             });
             const d = await r.json();
-            if (r.ok && d.ok) {
+            
+            // Handle async mode (llama.cpp returns 202 with job_id)
+            if (d.async && d.job_id) {
+              await pollEngineStartup(d.job_id);
+            } else if (r.ok && d.ok) {
               if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Done ✓'; engineSwitchStatus.style.color = 'var(--green, #4caf50)'; }
               await fetchModels();
               await updateEngineStatus();
+              applyEngineBtn.disabled = false;
+              setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 4000);
             } else {
               const msg = d.error || 'Failed';
               if (engineSwitchStatus) { engineSwitchStatus.textContent = '⚠ ' + msg; engineSwitchStatus.style.color = 'var(--red)'; }
-              // Revert the dropdown to the actual active engine
               await updateEngineStatus();
+              applyEngineBtn.disabled = false;
+              setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 4000);
             }
           } catch {
             if (engineSwitchStatus) { engineSwitchStatus.textContent = 'Error'; engineSwitchStatus.style.color = 'var(--red)'; }
-          } finally {
             applyEngineBtn.disabled = false;
             setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 4000);
           }
         });
+      }
+      
+      // Poll engine startup progress
+      async function pollEngineStartup(jobId) {
+        const maxPolls = 150; // 150 * 1s = 2.5 minutes max
+        let polls = 0;
+        
+        const poll = async () => {
+          polls++;
+          try {
+            const r = await fetch(`/api/engine-startup-status?job_id=${jobId}`);
+            const d = await r.json();
+            
+            if (d.status === 'complete') {
+              if (engineSwitchStatus) { 
+                engineSwitchStatus.textContent = 'Done ✓'; 
+                engineSwitchStatus.style.color = 'var(--green, #4caf50)'; 
+              }
+              await fetchModels();
+              await updateEngineStatus();
+              applyEngineBtn.disabled = false;
+              setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 4000);
+              return;
+            }
+            
+            if (d.status === 'failed') {
+              if (engineSwitchStatus) { 
+                engineSwitchStatus.textContent = '⚠ ' + (d.error || 'Failed'); 
+                engineSwitchStatus.style.color = 'var(--red)'; 
+              }
+              await updateEngineStatus();
+              applyEngineBtn.disabled = false;
+              setTimeout(() => { if (engineSwitchStatus) engineSwitchStatus.textContent = ''; }, 6000);
+              return;
+            }
+            
+            // Still in progress - show status
+            if (engineSwitchStatus) {
+              const pct = d.progress_pct || 0;
+              const elapsed = d.elapsed_secs || 0;
+              const msg = d.message || 'Loading...';
+              engineSwitchStatus.textContent = `${msg} (${pct}%, ${elapsed}s)`;
+              engineSwitchStatus.style.color = 'var(--accent)';
+            }
+            
+            if (polls < maxPolls) {
+              setTimeout(poll, 1000);
+            } else {
+              if (engineSwitchStatus) { 
+                engineSwitchStatus.textContent = '⚠ Timeout'; 
+                engineSwitchStatus.style.color = 'var(--red)'; 
+              }
+              applyEngineBtn.disabled = false;
+            }
+          } catch {
+            if (polls < maxPolls) {
+              setTimeout(poll, 1000);
+            } else {
+              if (engineSwitchStatus) { 
+                engineSwitchStatus.textContent = '⚠ Connection lost'; 
+                engineSwitchStatus.style.color = 'var(--red)'; 
+              }
+              applyEngineBtn.disabled = false;
+            }
+          }
+        };
+        
+        poll();
       }
 
         // Image generation bindings

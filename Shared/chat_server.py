@@ -68,6 +68,41 @@ def _cleanup_old_image_jobs():
         for jid in stale:
             del IMAGE_JOBS[jid]
 
+# ── Engine Startup Job Tracking ────────────────────────────────
+ENGINE_STARTUP_JOBS = {}
+ENGINE_STARTUP_JOBS_LOCK = threading.RLock()
+
+def _register_engine_startup_job(job_id, engine, model=""):
+    with ENGINE_STARTUP_JOBS_LOCK:
+        ENGINE_STARTUP_JOBS[job_id] = {
+            "status": "starting",
+            "engine": engine,
+            "model": model,
+            "phase": "initializing",
+            "progress_pct": 0,
+            "message": "Starting engine...",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "error": None,
+        }
+
+def _update_engine_startup_job(job_id, **kwargs):
+    with ENGINE_STARTUP_JOBS_LOCK:
+        if job_id in ENGINE_STARTUP_JOBS:
+            ENGINE_STARTUP_JOBS[job_id].update(kwargs)
+            ENGINE_STARTUP_JOBS[job_id]["updated_at"] = time.time()
+
+def _get_engine_startup_job(job_id):
+    with ENGINE_STARTUP_JOBS_LOCK:
+        return ENGINE_STARTUP_JOBS.get(job_id, {}).copy()
+
+def _cleanup_old_engine_startup_jobs():
+    now = time.time()
+    with ENGINE_STARTUP_JOBS_LOCK:
+        stale = [jid for jid, j in ENGINE_STARTUP_JOBS.items() if now - j["updated_at"] > 300]
+        for jid in stale:
+            del ENGINE_STARTUP_JOBS[jid]
+
 # Optional: psutil for hardware stats (graceful fallback to native APIs if not installed)
 try:
     import psutil
@@ -569,14 +604,24 @@ def _detect_chat_template(model_path):
     # ChatML family (Phi-3, older Qwen, etc.) — usually embedded, skip
     return None
 
-def _start_llama(model_path):
-    """Start llama-server with the given GGUF model path."""
+def _start_llama(model_path, job_id=None):
+    """Start llama-server with the given GGUF model path.
+    
+    If job_id is provided, updates ENGINE_STARTUP_JOBS with progress.
+    """
     global _LLAMA_PROC
     if not LLAMA_BIN or not os.path.isfile(LLAMA_BIN):
+        if job_id:
+            _update_engine_startup_job(job_id, status="failed", error="llama-server binary not found")
         return False
     if not model_path or not os.path.isfile(model_path):
+        if job_id:
+            _update_engine_startup_job(job_id, status="failed", error=f"Model file not found: {model_path}")
         return False
     try:
+        if job_id:
+            _update_engine_startup_job(job_id, phase="loading_model", message="Loading model...", progress_pct=5)
+        
         bin_dir = os.path.dirname(os.path.abspath(LLAMA_BIN))
         env = os.environ.copy()
         # Add binary dir to library path for bundled .so/.dll files
@@ -590,24 +635,92 @@ def _start_llama(model_path):
             "--port", str(LLAMA_PORT),
             "--ctx-size", "4096",
             "--n-predict", "-1",
-            "--log-disable",
         ]
         chat_template = _detect_chat_template(model_path)
         if chat_template:
             cmd += ["--chat-template", chat_template]
+        
+        # Capture stderr for progress tracking; stdout to devnull
         with _LLAMA_PROC_LOCK:
             _LLAMA_PROC = subprocess.Popen(
                 cmd, env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.PIPE if job_id else subprocess.DEVNULL
             )
-        # Wait for it to be ready
-        for _ in range(60):
+        
+        # Parse stderr for progress while waiting for server to be ready
+        stderr_lines = []
+        start_time = time.time()
+        max_wait = 120  # 2 minutes max
+        
+        while time.time() - start_time < max_wait:
             if _is_llama_running():
+                if job_id:
+                    _update_engine_startup_job(job_id, status="complete", phase="ready", 
+                                                message="Engine ready", progress_pct=100)
                 return True
-            time.sleep(1)
+            
+            # Read stderr if we're tracking progress
+            if job_id and _LLAMA_PROC and _LLAMA_PROC.stderr:
+                import select
+                try:
+                    # Non-blocking read on Unix
+                    readable, _, _ = select.select([_LLAMA_PROC.stderr], [], [], 0.1)
+                    if readable:
+                        line = _LLAMA_PROC.stderr.readline()
+                        if line:
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            stderr_lines.append(line_str)
+                            # Parse llama-server progress patterns
+                            _parse_llama_startup_progress(job_id, line_str, start_time)
+                except Exception:
+                    pass
+            
+            # Update progress based on elapsed time if no specific progress
+            if job_id:
+                elapsed = time.time() - start_time
+                # Estimate progress: most of the time is model loading
+                # Assume ~60s typical load time, scale to 95% max before "ready"
+                estimated_pct = min(95, int(5 + (elapsed / 60) * 85))
+                _update_engine_startup_job(job_id, progress_pct=estimated_pct,
+                                            message=f"Loading model... ({int(elapsed)}s)")
+            else:
+                time.sleep(1)
+        
+        # Timeout - collect any remaining stderr for error message
+        error_msg = "llama-server failed to start (timeout)"
+        if stderr_lines:
+            # Get last few lines that might have error info
+            recent = [l for l in stderr_lines[-10:] if l and 'error' in l.lower()]
+            if recent:
+                error_msg = f"llama-server error: {recent[-1]}"
+        
+        if job_id:
+            _update_engine_startup_job(job_id, status="failed", error=error_msg)
         return False
-    except Exception:
+    except Exception as e:
+        if job_id:
+            _update_engine_startup_job(job_id, status="failed", error=str(e))
         return False
+
+def _parse_llama_startup_progress(job_id, line, start_time):
+    """Parse llama-server stderr line and update progress."""
+    line_lower = line.lower()
+    
+    # Model loading phases from llama.cpp logs
+    if "loading model" in line_lower or "llama_model_load" in line_lower:
+        _update_engine_startup_job(job_id, phase="loading_model", message="Loading model weights...", progress_pct=15)
+    elif "model size" in line_lower or "model params" in line_lower:
+        _update_engine_startup_job(job_id, phase="loading_model", message="Model loaded, initializing...", progress_pct=50)
+    elif "kv cache" in line_lower or "kv_cache" in line_lower:
+        _update_engine_startup_job(job_id, phase="init_context", message="Initializing KV cache...", progress_pct=70)
+    elif "warming up" in line_lower or "warmup" in line_lower:
+        _update_engine_startup_job(job_id, phase="warmup", message="Warming up model...", progress_pct=85)
+    elif "listening" in line_lower or "server listening" in line_lower:
+        _update_engine_startup_job(job_id, phase="ready", message="Server ready", progress_pct=95)
+    elif "error" in line_lower:
+        # Don't mark as failed yet, just update message
+        _update_engine_startup_job(job_id, message=f"Warning: {line[:100]}")
 
 def _kill_ollama():
     """Stop any running Ollama process. Platform-specific."""
@@ -1066,6 +1179,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/image-progress":
             self._get_image_progress()
 
+        # Engine startup progress API
+        elif path == "/api/engine-startup-status":
+            self._get_engine_startup_status()
+
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
             self._proxy_ollama("GET")
@@ -1365,7 +1482,11 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data.encode())
 
     def _switch_engine_endpoint(self):
-        """Kill the current chat engine and start the requested one."""
+        """Kill the current chat engine and start the requested one.
+        
+        For llama.cpp: returns job_id immediately, starts async, poll /api/engine-startup-status
+        For Ollama: synchronous (fast startup)
+        """
         request_context = self._build_request_context("/api/switch-engine")
         body = self._read_body()
         try:
@@ -1374,6 +1495,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             payload = {}
 
         engine = payload.get("engine", "ollama")
+        async_mode = payload.get("async", True)  # Default to async for llama.cpp
+        
         if engine not in ("ollama", "llama"):
             self.send_response(400)
             self._cors_headers()
@@ -1401,18 +1524,59 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 _persist_settings_file(settings)
                 _set_active_engine("llama")
 
-                # Stop Ollama, start llama-server
+                # Stop Ollama first
                 _kill_ollama()
                 _kill_llama()
-                ok = _start_llama(model_path)
-                if not ok:
-                    # Revert both in-memory state and saved settings
-                    _set_active_engine("ollama")
-                    settings["chatEngine"] = "ollama"
-                    _persist_settings_file(settings)
-                    raise RuntimeError("llama-server failed to start. Check that the engine is installed.")
+                
+                if async_mode:
+                    # Start async and return job_id immediately
+                    job_id = str(uuid.uuid4())
+                    _register_engine_startup_job(job_id, engine, model_file)
+                    
+                    def _async_start():
+                        try:
+                            _update_engine_startup_job(job_id, phase="killing_engines", 
+                                                       message="Stopping other engines...", progress_pct=5)
+                            ok = _start_llama(model_path, job_id=job_id)
+                            if not ok:
+                                # Revert both in-memory state and saved settings
+                                _set_active_engine("ollama")
+                                settings["chatEngine"] = "ollama"
+                                _persist_settings_file(settings)
+                                job = _get_engine_startup_job(job_id)
+                                if job.get("status") != "failed":
+                                    _update_engine_startup_job(job_id, status="failed", 
+                                                               error="llama-server failed to start")
+                        except Exception as e:
+                            _set_active_engine("ollama")
+                            settings["chatEngine"] = "ollama"
+                            _persist_settings_file(settings)
+                            _update_engine_startup_job(job_id, status="failed", error=str(e))
+                    
+                    threading.Thread(target=_async_start, daemon=True).start()
+                    
+                    self.send_response(202)  # Accepted
+                    self.send_header("Content-Type", "application/json")
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "ok": True, 
+                        "async": True,
+                        "job_id": job_id, 
+                        "engine": engine,
+                        "message": "Engine switch started. Poll /api/engine-startup-status?job_id=..."
+                    }).encode())
+                    return
+                else:
+                    # Synchronous mode (legacy)
+                    ok = _start_llama(model_path)
+                    if not ok:
+                        _set_active_engine("ollama")
+                        settings["chatEngine"] = "ollama"
+                        _persist_settings_file(settings)
+                        raise RuntimeError("llama-server failed to start. Check that the engine is installed.")
             else:
-                # Stop llama-server, start Ollama
+                # Stop llama-server, start Ollama (fast, always sync)
                 _kill_llama()
                 if not _is_ollama_running():
                     ok = _start_ollama()
@@ -1558,6 +1722,48 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             resp["image_b64"] = job.get("image_b64")
             resp["mime_type"] = "image/png"
         elif job.get("status") == "error":
+            resp["error"] = job.get("error", "Unknown error.")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(resp).encode())
+
+    def _get_engine_startup_status(self):
+        """Poll endpoint for engine startup progress."""
+        query = parse_qs(urlparse(self.path).query)
+        job_id = query.get("job_id", [None])[0]
+        if not job_id:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing job_id parameter."}).encode())
+            return
+
+        job = _get_engine_startup_job(job_id)
+        if not job:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Job not found."}).encode())
+            return
+
+        # Build response with progress info
+        elapsed = time.time() - job.get("started_at", time.time())
+        resp = {
+            "status": job.get("status"),
+            "engine": job.get("engine"),
+            "model": job.get("model"),
+            "phase": job.get("phase"),
+            "progress_pct": job.get("progress_pct", 0),
+            "message": job.get("message", ""),
+            "elapsed_secs": int(elapsed),
+        }
+
+        if job.get("status") == "failed":
             resp["error"] = job.get("error", "Unknown error.")
 
         self.send_response(200)
