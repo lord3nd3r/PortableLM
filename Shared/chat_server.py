@@ -1378,13 +1378,24 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 if not os.path.isfile(model_path) or not model_path.lower().endswith(".gguf"):
                     raise RuntimeError(f"Model '{model_file}' not found.")
 
+                # Persist intent and set active engine BEFORE the slow startup
+                # so a page reload during the 60-second wait sees the correct state.
+                settings = _load_settings_file()
+                settings["chatEngine"] = "llama"
+                settings["llamaModel"] = model_file
+                _persist_settings_file(settings)
+                _set_active_engine("llama")
+
                 # Stop Ollama, start llama-server
                 _kill_ollama()
                 _kill_llama()
                 ok = _start_llama(model_path)
                 if not ok:
+                    # Revert both in-memory state and saved settings
+                    _set_active_engine("ollama")
+                    settings["chatEngine"] = "ollama"
+                    _persist_settings_file(settings)
                     raise RuntimeError("llama-server failed to start. Check that the engine is installed.")
-                _set_active_engine("llama")
             else:
                 # Stop llama-server, start Ollama
                 _kill_llama()
@@ -1395,11 +1406,11 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 _set_active_engine("ollama")
                 model_file = ""
 
-            # Persist the choice
-            settings = _load_settings_file()
-            settings["chatEngine"] = engine
-            settings["llamaModel"] = model_file if engine == "llama" else settings.get("llamaModel", "")
-            _persist_settings_file(settings)
+                # Persist the choice
+                settings = _load_settings_file()
+                settings["chatEngine"] = engine
+                settings["llamaModel"] = model_file if engine == "llama" else settings.get("llamaModel", "")
+                _persist_settings_file(settings)
 
             _log_event(logging.INFO, f"Chat engine switched to '{engine}'", request_context=request_context)
             self.send_response(200)
