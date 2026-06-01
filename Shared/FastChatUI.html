@@ -2930,7 +2930,13 @@
             D.chatEngineStatus.textContent = activeEngine === 'llama' ? 'Running (llama.cpp)' : 'Running';
             D.imgStopOllama.style.display = 'inline-block';
             D.imgStartOllama.style.display = 'none';
-            D.imgGenBtn.disabled = true;
+            // Only block image gen when Ollama is running (RAM conflict).
+            // llama.cpp runs independently so image gen can still work.
+            if (ollamaUp) {
+              D.imgGenBtn.disabled = true;
+            } else if (sdReady && sdHealthy) {
+              D.imgGenBtn.disabled = false;
+            }
           } else {
             D.chatEngineDot.className = 'img-engine-dot off';
             D.chatEngineStatus.textContent = 'Stopped';
