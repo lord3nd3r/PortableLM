@@ -2817,8 +2817,14 @@
     }
     function updateSysUI() {
       D.logModeSel.value = S.logMode === 'all' ? 'all' : 'errors_only';
-      if (S.globalSys) D.sysBtn.classList.add('has-global');
-      else D.sysBtn.classList.remove('has-global');
+      if (S.globalSys) {
+        D.sysBtn.classList.add('has-global');
+        // Populate textarea if it doesn't already have a per-conv override
+        const conv = getConv();
+        if (!conv || !conv.sys) D.sysTa.value = S.globalSys;
+      } else {
+        D.sysBtn.classList.remove('has-global');
+      }
     }
 
       // ÔöÇÔöÇ Models ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
@@ -3449,7 +3455,8 @@
         S.curId = id;
         const conv = getConv();
         if (conv && conv.model) applyModel(conv.model);
-        D.sysTa.value = conv?.sys || '';
+        // Use the conv's own system prompt, or fall back to the global default
+        D.sysTa.value = conv?.sys || S.globalSys || '';
         renderChat();
         renderSB();
         updateTitle();
