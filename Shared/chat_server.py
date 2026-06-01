@@ -1563,9 +1563,18 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             # llama.cpp: translate Ollama /api/chat → OpenAI /v1/chat/completions
             if active == "llama" and ollama_path == "/api/chat":
                 ollama_req = json.loads(body) if body else {}
+                # Merge consecutive same-role messages — gemma (and many other models)
+                # require strict user/assistant alternation in their chat templates.
+                raw_messages = ollama_req.get("messages", [])
+                merged_messages = []
+                for msg in raw_messages:
+                    if merged_messages and merged_messages[-1]["role"] == msg["role"]:
+                        merged_messages[-1]["content"] = (merged_messages[-1]["content"] or "") + "\n" + (msg["content"] or "")
+                    else:
+                        merged_messages.append(dict(msg))
                 openai_req = {
                     "model": ollama_req.get("model", "local"),
-                    "messages": ollama_req.get("messages", []),
+                    "messages": merged_messages,
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
                 }
