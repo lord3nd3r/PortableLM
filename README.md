@@ -10,7 +10,9 @@ With a unified architecture, you can initialize your AI models once and choose t
 * **Cross-Platform:** Uses an intelligent `Shared` volume system — download your 5GB+ AI models *once*, and use them natively on Windows, macOS, Linux, and Android without duplication.
 * **Fully Offline:** Runs completely air-gapped after initial setup. Your data never leaves your machine.
 * **Network Proxied UI:** The custom Python HTTP server serves a blazing-fast dark mode chat UI. Access the AI from your phone or tablet on the same WiFi — no CORS headaches.
-* **Hardware Accelerated:** Natively capitalizes on AVX CPU instructions, NVIDIA CUDA, or Apple Metal GPU accelerators dynamically when plugged into different host machines.
+* **Hardware Accelerated:** Natively capitalizes on AVX CPU instructions, NVIDIA CUDA, AMD ROCm, Vulkan, or Apple Metal GPU accelerators dynamically when plugged into different host machines.
+* **Dual Chat Backends:** Switch between **Ollama** (multi-model, easy model management) and **llama.cpp** (lower latency, direct GGUF loading) from the settings panel without restarting.
+* **AI Image Generation:** Built-in Stable Diffusion image generation via stable-diffusion.cpp — same GPU acceleration, fully offline.
 
 ---
 
@@ -30,7 +32,7 @@ With a unified architecture, you can initialize your AI models once and choose t
  ├── 📁 Mac        # Native macOS offline installers & launchers
  ├── 📁 Windows    # Native Windows offline automatic UI menus
  └── 📁 Shared     # Unified Data System
-      ├── 📁 bin         (Isolated executables: ollama-windows.exe, ollama-darwin...)
+      ├── 📁 bin         (Isolated executables: ollama, llama-server, sd image engine)
       ├── 📁 chat_data   (Cross-platform persistent conversation history)
       ├── 📁 models      (HuggingFace GGUF weights & local database mapping)
       └── 📁 python      (Isolated portable python environment)
@@ -47,7 +49,20 @@ Curated installer for high-quality, locally operable models:
 | **Gemma 2 2B Abliterated** | ~1.6 GB | Fast, smart for its size. Great starting point. |
 | **Gemma 4 E4B Ultra** | ~5.34 GB | Aggressively compliant fine-tune. |
 | **Qwen 3.5 9B** | ~5.2 GB | Large reasoning model, raw unbiased answers. |
-| **Custom .gguf** | Varies | Download any GGUF weight from HuggingFace directly. |
+| **Custom .gguf** | Varies | Drop any GGUF file into `Shared/models` — works with both Ollama and llama.cpp. |
+
+---
+
+## Chat Backend
+
+PortableLM supports two chat engines, switchable at runtime from the ⚙ settings panel:
+
+| Backend | Description |
+|---|---|
+| **Ollama** *(default)* | Full-featured model manager. Supports multiple loaded models, easy switching. |
+| **llama.cpp** | Direct GGUF inference. Lower overhead, no model pull required — just drop a `.gguf` into `Shared/models`. |
+
+The selected backend and model are persisted across restarts. The install script downloads both engine binaries automatically, selecting the best GPU build for your hardware (CUDA / ROCm / Vulkan / CPU).
 
 ---
 
@@ -148,6 +163,8 @@ Use your PC's AI from your phone on the couch:
 | Script closes instantly (Windows) | Windows App Execution Aliases conflict. Run via cmd or as Admin. |
 | "Engine Not Found" | Run the install script before the start script. |
 | Slow generation | Model too large for your RAM. Use the Gemma 2 2B model. |
+| Chat error with llama.cpp | Ensure a `.gguf` file is selected in the settings panel before chatting. |
+| llama.cpp returns 400 | Usually a model mismatch. Re-select the model in settings and click Apply. |
 
 ---
 
