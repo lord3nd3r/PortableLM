@@ -3788,11 +3788,12 @@
 
       function renderMd(text) {
         if (!text) return '';
-        // Extract think blocks before markdown parsing to avoid interference
+        
+        // Extract think blocks and replace with placeholders
         const thinkBlocks = [];
-        let cleanedText = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, (match) => {
+        let cleanedText = text.replace(/(<think>[\s\S]*?(?:<\/think>|$))/gi, (match) => {
           thinkBlocks.push(processThinkTags(match));
-          return `\n\n__THINK_PLACEHOLDER_${thinkBlocks.length - 1}__\n\n`;
+          return `\n\n__THINK_PH_${thinkBlocks.length - 1}__\n\n`;
         });
 
         let html = '';
@@ -3804,8 +3805,9 @@
 
         // Restore think blocks
         thinkBlocks.forEach((block, idx) => {
-          html = html.replace(`<p>__THINK_PLACEHOLDER_${idx}__</p>`, block);
-          html = html.replace(`__THINK_PLACEHOLDER_${idx}__`, block);
+          const ph = `__THINK_PH_${idx}__`;
+          html = html.replace(`<p>${ph}</p>`, block);
+          html = html.replace(ph, block);
         });
 
         return html;
