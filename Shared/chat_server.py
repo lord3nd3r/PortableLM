@@ -664,6 +664,45 @@ def _is_ollama_running():
     except Exception:
         return False
 
+def _is_ollama_model_loaded():
+    """Check if any model is currently loaded in Ollama RAM/VRAM memory."""
+    try:
+        req = urllib.request.Request(OLLAMA_HOST + "/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = data.get("models", [])
+                return len(models) > 0
+    except Exception:
+        pass
+    return False
+
+def _unload_ollama_models():
+    """Unload all active models from Ollama memory via keep_alive: 0."""
+    try:
+        req = urllib.request.Request(OLLAMA_HOST + "/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = data.get("models", [])
+                for m in models:
+                    model_name = m.get("model") or m.get("name")
+                    if model_name:
+                        unload_payload = json.dumps({"model": model_name, "keep_alive": 0}).encode("utf-8")
+                        unload_req = urllib.request.Request(
+                            OLLAMA_HOST + "/api/generate",
+                            data=unload_payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        try:
+                            with urllib.request.urlopen(unload_req, timeout=5) as u_resp:
+                                u_resp.read()
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
 def _is_llama_running():
     """Check if llama-server responds on its default port."""
     try:
@@ -912,7 +951,10 @@ def _parse_llama_startup_progress(job_id, line, start_time):
         _update_engine_startup_job(job_id, message=f"Warning: {line[:100]}")
 
 def _kill_ollama():
-    """Stop any running Ollama process. Platform-specific."""
+    """Stop any running Ollama process or unload models. Platform-specific."""
+    # First, attempt to unload models via HTTP API
+    _unload_ollama_models()
+
     plat = platform.system()
     try:
         if plat == "Windows":
@@ -928,18 +970,18 @@ def _kill_ollama():
             except Exception:
                 pass
         elif plat == "Linux":
-            subprocess.run(["pkill", "-f", "ollama-linux"], capture_output=True)
-            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
-            subprocess.run(["pkill", "-f", "ollama"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama-linux"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama serve"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True)
         else:  # macOS
-            subprocess.run(["pkill", "-f", "ollama-darwin"], capture_output=True)
-            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
-            subprocess.run(["pkill", "-f", "ollama"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama-darwin"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama serve"], capture_output=True)
+            subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True)
     except Exception:
         pass
-    # Wait for port to be free
-    for _ in range(20):
-        if not _is_ollama_running():
+    # Wait for port to be free or model to be unloaded from memory
+    for _ in range(10):
+        if not _is_ollama_running() or not _is_ollama_model_loaded():
             break
         time.sleep(0.5)
 
@@ -1687,12 +1729,14 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def _get_engine_status(self):
         """Return which engines are currently running."""
         ollama_up = _is_ollama_running()
+        ollama_model_loaded = _is_ollama_model_loaded() if ollama_up else False
         llama_up = _is_llama_running()
         current_models = _find_sd_models()
         with ACTIVE_ENGINE_LOCK:
             active = ACTIVE_ENGINE
         data = json.dumps({
             "ollama": ollama_up,
+            "ollama_model_loaded": ollama_model_loaded,
             "llama": llama_up,
             "active_engine": active,
             "llama_available": bool(LLAMA_BIN and os.path.isfile(LLAMA_BIN)),
@@ -1713,7 +1757,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         request_context = self._build_request_context("/api/stop-ollama")
         try:
             _kill_ollama()
-            _log_event(logging.INFO, "Ollama engine stopped by user", request_context=request_context)
+            _kill_llama()
+            _log_event(logging.INFO, "Chat engine stopped by user", request_context=request_context)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
@@ -1926,14 +1971,14 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "Image generation is not set up. Please run the installer."}).encode())
             return
 
-        # Warn if Ollama is still running (RAM collision risk)
-        if _is_ollama_running():
+        # Warn if an Ollama model is loaded in memory (RAM collision risk)
+        if _is_ollama_model_loaded():
             self.send_response(409)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
             self.end_headers()
             self.wfile.write(json.dumps({
-                "error": "Chat engine is running. Please stop it first to free memory for image generation.",
+                "error": "Chat engine model is loaded in memory. Please stop/unload it first to free memory for image generation.",
                 "needs_stop": True
             }).encode())
             return

@@ -2959,14 +2959,18 @@
           }
 
           // Chat engine row
+          const ollamaModelLoaded = d.ollama_model_loaded !== undefined ? d.ollama_model_loaded : ollamaUp;
+          const engineInUse = ollamaModelLoaded || (activeEngine === 'llama' && d.llama);
           if (ollamaUp || (activeEngine === 'llama' && d.llama)) {
-            D.chatEngineDot.className = 'img-engine-dot on';
-            D.chatEngineStatus.textContent = activeEngine === 'llama' ? 'Running (llama.cpp)' : 'Running';
-            D.imgStopOllama.style.display = 'inline-block';
-            D.imgStartOllama.style.display = 'none';
-            // Only block image gen when Ollama is running (RAM conflict).
+            D.chatEngineDot.className = engineInUse ? 'img-engine-dot on' : 'img-engine-dot off';
+            D.chatEngineStatus.textContent = activeEngine === 'llama'
+              ? (d.llama ? 'Running (llama.cpp)' : 'Stopped')
+              : (ollamaModelLoaded ? 'Running (Model loaded)' : 'Idle (No model loaded)');
+            D.imgStopOllama.style.display = engineInUse ? 'inline-block' : 'none';
+            D.imgStartOllama.style.display = engineInUse ? 'none' : 'inline-block';
+            // Only block image gen when an Ollama model is actually loaded in RAM (RAM conflict).
             // llama.cpp runs independently so image gen can still work.
-            if (ollamaUp) {
+            if (ollamaModelLoaded) {
               D.imgGenBtn.disabled = true;
             } else if (sdReady && sdHealthy) {
               D.imgGenBtn.disabled = false;
@@ -3019,7 +3023,8 @@
           try {
             const r = await fetch('/api/engine-status');
             const d = await r.json();
-            if (d.ollama === desiredOllamaState) {
+            const ollamaModelLoaded = d.ollama_model_loaded !== undefined ? d.ollama_model_loaded : d.ollama;
+            if ((ollamaModelLoaded === desiredOllamaState || (!d.ollama && !desiredOllamaState)) && (!d.llama || !desiredOllamaState)) {
               await updateEngineStatus();
               return true;
             }
