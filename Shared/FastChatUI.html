@@ -1116,6 +1116,44 @@
         display: block;
         border: 1px solid var(--bd);
       }
+
+      /* Collapsible Reasoning / Thinking Blocks */
+      details.think-block {
+        margin: 8px 0 12px 0;
+        background: var(--bg2);
+        border: 1px solid var(--bd);
+        border-radius: 10px;
+        overflow: hidden;
+        font-size: 13px;
+      }
+      details.think-block summary {
+        padding: 8px 12px;
+        background: var(--bgh);
+        color: var(--t2);
+        font-weight: 500;
+        cursor: pointer;
+        user-select: none;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        transition: background 0.15s, color 0.15s;
+      }
+      details.think-block summary:hover {
+        background: var(--bg3);
+        color: var(--t1);
+      }
+      details.think-block summary i {
+        color: var(--grad1);
+        font-size: 13px;
+      }
+      details.think-block .think-content {
+        padding: 12px;
+        color: var(--t2);
+        font-style: italic;
+        border-top: 1px solid var(--bd);
+        line-height: 1.6;
+        white-space: pre-wrap;
+      }
       .msg-pdf-pill {
         display: inline-flex;
         align-items: center;
@@ -3674,7 +3712,7 @@
                 const p = JSON.parse(line);
                 if (p.message?.content) {
                   aiMsg.content += p.message.content;
-                  if (contentEl) contentEl.textContent = aiMsg.content;
+                  if (contentEl) contentEl.innerHTML = renderMd(aiMsg.content);
                   scrollEnd();
                 }
               } catch {}
@@ -3731,13 +3769,49 @@
         };
         marked.setOptions({ gfm: true, breaks: true, renderer: rdr });
       }
-      function renderMd(text) {
-        if (typeof marked === 'undefined')
-          return esc(text).replace(/\n/g, '<br>');
-        return marked.parse(text, { breaks: true });
+      function processThinkTags(text) {
+        if (!text) return '';
+        let processed = text;
+        // Replace completed <think>...</think> blocks with details element
+        processed = processed.replace(/<think>([\s\S]*?)<\/think>/gi, (_, thinkContent) => {
+          const trimmed = thinkContent.trim();
+          if (!trimmed) return '';
+          return `<details class="think-block"><summary><i class="fa-solid fa-brain"></i> Thought Process</summary><div class="think-content">${esc(trimmed)}</div></details>`;
+        });
+        // Replace unclosed <think>... (streaming) with open details element
+        processed = processed.replace(/<think>([\s\S]*?)$/gi, (_, thinkContent) => {
+          const trimmed = thinkContent.trim();
+          return `<details class="think-block" open><summary><i class="fa-solid fa-brain"></i> Thinking...</summary><div class="think-content">${esc(trimmed)}</div></details>`;
+        });
+        return processed;
       }
 
-      // ÔöÇÔöÇ Rendering ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+      function renderMd(text) {
+        if (!text) return '';
+        // Extract think blocks before markdown parsing to avoid interference
+        const thinkBlocks = [];
+        let cleanedText = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, (match) => {
+          thinkBlocks.push(processThinkTags(match));
+          return `\n\n__THINK_PLACEHOLDER_${thinkBlocks.length - 1}__\n\n`;
+        });
+
+        let html = '';
+        if (typeof marked === 'undefined') {
+          html = esc(cleanedText).replace(/\n/g, '<br>');
+        } else {
+          html = marked.parse(cleanedText, { breaks: true });
+        }
+
+        // Restore think blocks
+        thinkBlocks.forEach((block, idx) => {
+          html = html.replace(`<p>__THINK_PLACEHOLDER_${idx}__</p>`, block);
+          html = html.replace(`__THINK_PLACEHOLDER_${idx}__`, block);
+        });
+
+        return html;
+      }
+
+      // ── Rendering ──────────────────────────────────────────────
       function renderSB() {
         D.cvList.innerHTML = S.convs
           .map(
@@ -3806,8 +3880,7 @@
       }
 
       function renderAI(msg, isLast) {
-        const parsed =
-          S.streaming && isLast ? esc(msg.content) : renderMd(msg.content);
+        const parsed = renderMd(msg.content);
         const actions =
           !S.streaming || !isLast
             ? `
