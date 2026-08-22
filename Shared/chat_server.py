@@ -410,6 +410,10 @@ def _find_gguf_models():
 _LLAMA_PROC = None
 _LLAMA_PROC_LOCK = threading.RLock()
 
+# Track the ollama serve subprocess so we can kill it cleanly
+_OLLAMA_PROC = None
+_OLLAMA_PROC_LOCK = threading.RLock()
+
 CHATS_DIR = os.path.join(SCRIPT_DIR, "chat_data")
 CHATS_FILE = os.path.join(CHATS_DIR, "chats.json")
 SETTINGS_FILE = os.path.join(CHATS_DIR, "settings.json")
@@ -872,37 +876,47 @@ def _start_llama(model_path, job_id=None):
         with _LLAMA_PROC_LOCK:
             _LLAMA_PROC = subprocess.Popen(
                 cmd, env=env,
-                stdout=subprocess.DEVNULL, 
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE if job_id else subprocess.DEVNULL
             )
-        
+
+        # Pump stderr into a queue from a background thread. A dedicated reader
+        # thread (rather than select.select on the pipe) works on Windows too,
+        # where select() only supports sockets, not pipe file descriptors.
+        stderr_queue = queue.Queue()
+        if job_id and _LLAMA_PROC.stderr:
+            def _pump_stderr(pipe, q):
+                try:
+                    for raw_line in iter(pipe.readline, b""):
+                        q.put(raw_line)
+                except Exception:
+                    pass
+            threading.Thread(target=_pump_stderr, args=(_LLAMA_PROC.stderr, stderr_queue), daemon=True).start()
+
         # Parse stderr for progress while waiting for server to be ready
         stderr_lines = []
         start_time = time.time()
         max_wait = 120  # 2 minutes max
-        
+
         while time.time() - start_time < max_wait:
             if _is_llama_running():
                 if job_id:
-                    _update_engine_startup_job(job_id, status="complete", phase="ready", 
+                    _update_engine_startup_job(job_id, status="complete", phase="ready",
                                                 message="Engine ready", progress_pct=100)
                 return True
-            
-            # Read stderr if we're tracking progress
-            if job_id and _LLAMA_PROC and _LLAMA_PROC.stderr:
-                import select
-                try:
-                    # Non-blocking read on Unix
-                    readable, _, _ = select.select([_LLAMA_PROC.stderr], [], [], 0.1)
-                    if readable:
-                        line = _LLAMA_PROC.stderr.readline()
-                        if line:
-                            line_str = line.decode('utf-8', errors='ignore').strip()
-                            stderr_lines.append(line_str)
-                            # Parse llama-server progress patterns
-                            _parse_llama_startup_progress(job_id, line_str, start_time)
-                except Exception:
-                    pass
+
+            # Drain any stderr lines the reader thread has picked up
+            if job_id:
+                while True:
+                    try:
+                        line = stderr_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if line:
+                        line_str = line.decode('utf-8', errors='ignore').strip()
+                        stderr_lines.append(line_str)
+                        # Parse llama-server progress patterns
+                        _parse_llama_startup_progress(job_id, line_str, start_time)
             
             # Update progress based on elapsed time if no specific progress
             if job_id:
@@ -912,6 +926,7 @@ def _start_llama(model_path, job_id=None):
                 estimated_pct = min(95, int(5 + (elapsed / 60) * 85))
                 _update_engine_startup_job(job_id, progress_pct=estimated_pct,
                                             message=f"Loading model... ({int(elapsed)}s)")
+                time.sleep(0.1)
             else:
                 time.sleep(1)
         
@@ -952,8 +967,22 @@ def _parse_llama_startup_progress(job_id, line, start_time):
 
 def _kill_ollama():
     """Stop any running Ollama process or unload models. Platform-specific."""
+    global _OLLAMA_PROC
     # First, attempt to unload models via HTTP API
     _unload_ollama_models()
+
+    # If we started the process ourselves, terminate that handle directly
+    with _OLLAMA_PROC_LOCK:
+        if _OLLAMA_PROC is not None:
+            try:
+                _OLLAMA_PROC.terminate()
+                _OLLAMA_PROC.wait(timeout=5)
+            except Exception:
+                try:
+                    _OLLAMA_PROC.kill()
+                except Exception:
+                    pass
+            _OLLAMA_PROC = None
 
     plat = platform.system()
     try:
@@ -979,14 +1008,15 @@ def _kill_ollama():
             subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True)
     except Exception:
         pass
-    # Wait for port to be free or model to be unloaded from memory
+    # Wait for both the port to be free and the model to be unloaded from memory
     for _ in range(10):
-        if not _is_ollama_running() or not _is_ollama_model_loaded():
+        if not _is_ollama_running() and not _is_ollama_model_loaded():
             break
         time.sleep(0.5)
 
 def _start_ollama():
     """Start Ollama in the background if binary exists."""
+    global _OLLAMA_PROC
     if not OLLAMA_BIN or not os.path.isfile(OLLAMA_BIN):
         return False
     try:
@@ -994,7 +1024,8 @@ def _start_ollama():
         env["OLLAMA_MODELS"] = os.path.join(SCRIPT_DIR, "models", "ollama_data")
         env["OLLAMA_ORIGINS"] = "*"
         env["OLLAMA_HOST"] = "127.0.0.1:11434"
-        subprocess.Popen([OLLAMA_BIN, "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _OLLAMA_PROC_LOCK:
+            _OLLAMA_PROC = subprocess.Popen([OLLAMA_BIN, "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Wait for it to be ready
         for _ in range(30):
             if _is_ollama_running():
@@ -1264,11 +1295,13 @@ def _run_sd_generation(job_id, payload, output_path):
         except Exception:
             pass
 
+        job = _get_image_job(job_id)
+        started_at = job.get("started_at", time.time())
         _update_image_job(
             job_id,
             status="done",
             image_b64=img_b64,
-            elapsed_ms=int((time.time() - IMAGE_JOBS[job_id]["started_at"]) * 1000),
+            elapsed_ms=int((time.time() - started_at) * 1000),
         )
     except Exception as e:
         if proc:
@@ -1857,22 +1890,26 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     
                     def _async_start():
                         try:
-                            _update_engine_startup_job(job_id, phase="killing_engines", 
+                            _update_engine_startup_job(job_id, phase="killing_engines",
                                                        message="Stopping other engines...", progress_pct=5)
                             ok = _start_llama(model_path, job_id=job_id)
                             if not ok:
-                                # Revert both in-memory state and saved settings
+                                # Revert in-memory state and saved settings. Reload from disk
+                                # first so we don't clobber settings the user changed via the
+                                # UI while llama-server was starting up.
                                 _set_active_engine("ollama")
-                                settings["chatEngine"] = "ollama"
-                                _persist_settings_file(settings)
+                                current_settings = _load_settings_file()
+                                current_settings["chatEngine"] = "ollama"
+                                _persist_settings_file(current_settings)
                                 job = _get_engine_startup_job(job_id)
                                 if job.get("status") != "failed":
-                                    _update_engine_startup_job(job_id, status="failed", 
+                                    _update_engine_startup_job(job_id, status="failed",
                                                                error="llama-server failed to start")
                         except Exception as e:
                             _set_active_engine("ollama")
-                            settings["chatEngine"] = "ollama"
-                            _persist_settings_file(settings)
+                            current_settings = _load_settings_file()
+                            current_settings["chatEngine"] = "ollama"
+                            _persist_settings_file(current_settings)
                             _update_engine_startup_job(job_id, status="failed", error=str(e))
                     
                     threading.Thread(target=_async_start, daemon=True).start()

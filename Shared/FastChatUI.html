@@ -2955,7 +2955,7 @@
         D.chat.style.display = mode === 'chat' ? 'flex' : 'none';
         D.imgPanel.classList.toggle('on', mode === 'image');
         D.inpArea = document.getElementById('inp-area');
-        if (D.inpArea) D.inpArea.style.display = mode === 'chat' ? 'block' : 'none';
+        if (D.inpArea) D.inpArea.style.display = mode === 'chat' ? 'flex' : 'none';
         if (mode === 'image') {
           updateEngineStatus();
           fetchImageModels();
@@ -3665,10 +3665,17 @@
         renderChat();
         scrollEnd();
 
-        const lastRow = D.msgs.lastElementChild;
-        const contentEl = lastRow ? lastRow.querySelector('.mt') : null;
-        if (contentEl)
-          contentEl.innerHTML =
+        // Re-query the content element each time instead of caching a single
+        // reference: a mid-stream renderChat() (e.g. from rateMsg()) replaces
+        // D.msgs.innerHTML and would otherwise leave us writing into a
+        // detached, invisible node.
+        const getContentEl = () =>
+          D.msgs.lastElementChild
+            ? D.msgs.lastElementChild.querySelector('.mt')
+            : null;
+        const startingEl = getContentEl();
+        if (startingEl)
+          startingEl.innerHTML =
             '<div class="typ"><span></span><span></span><span></span></div>';
 
         S.abort = new AbortController();
@@ -3700,7 +3707,8 @@
 
           const reader = res.body.getReader();
           const dec = new TextDecoder();
-          if (contentEl) contentEl.innerHTML = '';
+          const readerStartEl = getContentEl();
+          if (readerStartEl) readerStartEl.innerHTML = '';
 
           while (true) {
             const { done, value } = await reader.read();
@@ -3712,28 +3720,31 @@
                 const p = JSON.parse(line);
                 if (p.message?.content) {
                   aiMsg.content += p.message.content;
-                  if (contentEl) contentEl.innerHTML = renderMd(aiMsg.content);
+                  const streamEl = getContentEl();
+                  if (streamEl) streamEl.innerHTML = renderMd(aiMsg.content);
                   scrollEnd();
                 }
               } catch {}
             }
           }
-          if (contentEl) {
-            contentEl.innerHTML = renderMd(aiMsg.content);
-            contentEl.querySelectorAll('pre code').forEach((b) => {
+          const doneEl = getContentEl();
+          if (doneEl) {
+            doneEl.innerHTML = renderMd(aiMsg.content);
+            doneEl.querySelectorAll('pre code').forEach((b) => {
               if (!b.classList.contains('hljs')) hljs.highlightElement(b);
             });
           }
         } catch (err) {
+          const errEl = getContentEl();
           if (err.name === 'AbortError') {
             if (aiMsg.content) {
-              if (contentEl) contentEl.innerHTML = renderMd(aiMsg.content);
-            } else if (contentEl)
-              contentEl.innerHTML =
+              if (errEl) errEl.innerHTML = renderMd(aiMsg.content);
+            } else if (errEl)
+              errEl.innerHTML =
                 '<span style="color:var(--t3);font-style:italic;">[Stopped]</span>';
           } else {
-            if (contentEl)
-              contentEl.innerHTML = `<span style="color:var(--red);">ÔÜá ${esc(err.message)}</span>`;
+            if (errEl)
+              errEl.innerHTML = `<span style="color:var(--red);">ÔÜá ${esc(err.message)}</span>`;
             conv.msgs.pop();
           }
         } finally {
