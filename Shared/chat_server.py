@@ -241,7 +241,12 @@ def _find_free_port(start=8080, end=8200):
                 return port
             except OSError:
                 continue
-    return start  # fallback
+    # Whole range is occupied (e.g. start=8080 is already bound on this host).
+    # Let the OS assign an ephemeral port rather than returning a port we
+    # already know is taken.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 LLAMA_PORT = _find_free_port()
 LLAMA_HOST = f"http://127.0.0.1:{LLAMA_PORT}"
@@ -304,19 +309,37 @@ SD_MODELS = _find_sd_models()
 SD_MODEL = SD_MODELS[0]["path"] if SD_MODELS else None
 SD_ENABLED = SD_BINARY is not None and len(SD_MODELS) > 0
 
+_SD_BINARY_TEST_CACHE = {"result": None, "checked_at": 0.0}
+_SD_BINARY_TEST_LOCK = threading.Lock()
+_SD_BINARY_TEST_TTL = 30  # seconds
+
 def _test_sd_binary():
-    """Test if the SD binary can actually execute (catches missing VC++ runtime on Windows)."""
+    """Test if the SD binary can actually execute (catches missing VC++ runtime on Windows).
+
+    Cached briefly since this spawns a subprocess and engine status is polled
+    frequently, while the binary's ability to execute rarely changes.
+    """
+    now = time.time()
+    with _SD_BINARY_TEST_LOCK:
+        cached = _SD_BINARY_TEST_CACHE["result"]
+        if cached is not None and now - _SD_BINARY_TEST_CACHE["checked_at"] < _SD_BINARY_TEST_TTL:
+            return cached
+
     if not SD_BINARY or not os.path.isfile(SD_BINARY):
-        return False
-    try:
-        result = subprocess.run([SD_BINARY, "-h"], capture_output=True, timeout=10)
-        # sd -h returns non-zero but prints help; just check it doesn't crash with DLL errors
-        stderr = result.stderr.decode('utf-8', errors='ignore').lower()
-        if 'dll' in stderr or 'vcruntime' in stderr or 'msvcp' in stderr:
-            return False
-        return True
-    except Exception:
-        return False
+        result = False
+    else:
+        try:
+            proc_result = subprocess.run([SD_BINARY, "-h"], capture_output=True, timeout=10)
+            # sd -h returns non-zero but prints help; just check it doesn't crash with DLL errors
+            stderr = proc_result.stderr.decode('utf-8', errors='ignore').lower()
+            result = not ('dll' in stderr or 'vcruntime' in stderr or 'msvcp' in stderr)
+        except Exception:
+            result = False
+
+    with _SD_BINARY_TEST_LOCK:
+        _SD_BINARY_TEST_CACHE["result"] = result
+        _SD_BINARY_TEST_CACHE["checked_at"] = now
+    return result
 
 def _detect_sd_backend():
     """Probe which GPU backend this sd-cli binary was compiled with.
@@ -343,8 +366,8 @@ def _detect_sd_backend():
     for backend, rng in candidates:
         try:
             r = subprocess.run(
-                [SD_BINARY, '--backend', backend, '-m', '/dev/null',
-                 '-p', 'probe', '-o', '/dev/null'],
+                [SD_BINARY, '--backend', backend, '-m', os.devnull,
+                 '-p', 'probe', '-o', os.devnull],
                 capture_output=True, text=True, env=env, timeout=8
             )
             combined = (r.stdout + r.stderr).lower()
@@ -564,8 +587,9 @@ def _load_settings_file():
         "llamaModel": "",
     }
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
+        with DATA_FILE_LOCK:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
         if isinstance(loaded, dict):
             merged = dict(default_settings)
             merged.update(loaded)
@@ -820,7 +844,10 @@ def _truncate_messages_to_context(messages, max_tokens=3500, reserve_for_respons
             recent_messages.insert(0, msg)
             recent_tokens += tokens
         else:
-            break
+            # Skip this one oversized message rather than stopping the whole
+            # scan, so a single huge message doesn't zero out all the older,
+            # smaller messages that would still fit within budget.
+            continue
     
     # Count how many messages were dropped
     dropped_count = len(messages) - 1 - len(recent_messages)
@@ -1418,19 +1445,22 @@ def ensure_data_dir():
     """Create required data folders if they don't exist."""
     os.makedirs(CHATS_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
-    if not os.path.exists(CHATS_FILE):
-        with open(CHATS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    if not os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "globalSystemPrompt": "",
-                    "temperature": 0.7,
-                    "logMode": DEFAULT_LOG_MODE,
-                },
-                f,
-            )
+    # Hold the shared data-file lock across the check-then-create so a second
+    # server process pointed at the same data dir can't race this one.
+    with DATA_FILE_LOCK:
+        if not os.path.exists(CHATS_FILE):
+            with open(CHATS_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        if not os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "globalSystemPrompt": "",
+                        "temperature": 0.7,
+                        "logMode": DEFAULT_LOG_MODE,
+                    },
+                    f,
+                )
 
 class ChatHandler(http.server.BaseHTTPRequestHandler):
     """Handles all HTTP requests for the Portable AI Chat."""
@@ -1695,10 +1725,14 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(incoming, dict):
                 raise ValueError("Settings payload must be a JSON object")
 
-            settings = _load_settings_file()
-            settings.update(incoming)
-            settings["logMode"] = _normalize_log_mode(settings.get("logMode"))
-            _persist_settings_file(settings)
+            # Hold the lock across the whole load-update-persist cycle so two
+            # concurrent /api/settings requests can't interleave and silently
+            # drop one another's changes (lost update).
+            with DATA_FILE_LOCK:
+                settings = _load_settings_file()
+                settings.update(incoming)
+                settings["logMode"] = _normalize_log_mode(settings.get("logMode"))
+                _persist_settings_file(settings)
             _set_active_log_mode(settings["logMode"])
             _log_event(logging.INFO, "Settings saved successfully", request_context=request_context)
             self.send_response(200)
@@ -2002,7 +2036,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             payload = {}
 
-        if not SD_ENABLED:
+        # Re-scan for models rather than trusting the SD_ENABLED snapshot taken
+        # at import time, so a model downloaded after startup (via the model
+        # pull / HuggingFace download features) is picked up without a restart.
+        if not (SD_BINARY is not None and len(_find_sd_models()) > 0):
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
@@ -2484,7 +2521,18 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                         if line.startswith("data: "):
                             data = line[6:].strip()
                             if data == "[DONE]":
-                                break
+                                # Signal completion in the Ollama JSONL format
+                                # so clients relying on a final "done": true
+                                # frame don't hang waiting for one.
+                                try:
+                                    self.wfile.write((json.dumps({
+                                        "message": {"role": "assistant", "content": ""},
+                                        "done": True,
+                                    }) + "\n").encode())
+                                    self.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    pass
+                                return
                             try:
                                 j = json.loads(data)
                                 if "choices" in j and len(j["choices"]) > 0:
@@ -2586,6 +2634,12 @@ def open_browser_delayed():
 
 def main():
     ensure_data_dir()
+
+    # Warm up the CPU-sample baseline before the server starts accepting
+    # connections, so the first real /api/stats request doesn't pay the
+    # ~250ms blocking sample cost itself.
+    _get_hw_stats()
+
     startup_settings = _load_settings_file()
     _set_active_log_mode(startup_settings.get("logMode"))
 
@@ -2606,10 +2660,9 @@ def main():
     local_ip = "127.0.0.1"
     try:
         import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
     except Exception:
         pass
 

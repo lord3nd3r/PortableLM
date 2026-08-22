@@ -101,6 +101,12 @@
         --radius: 12px;
         --radius-lg: 18px;
         --radius-pill: 999px;
+
+        /* Aliases for tokens referenced elsewhere but not otherwise defined;
+           resolved per-theme since they point at theme-scoped variables. */
+        --accent: var(--grad1);
+        --muted: var(--t2);
+        --bg1: var(--bgh);
       }
 
       [data-theme='dark'] {
@@ -3292,7 +3298,7 @@
             <div class="mmo-icon"><i class="fa-solid ${isVision(m.name) ? 'fa-eye' : 'fa-microchip'}"></i></div>
             <div class="mmo-info">
                 <div class="mmo-name">${esc(m.name)}</div>
-                <div class="mmo-desc">${(m.size / 1e9).toFixed(1)} GB</div>
+                <div class="mmo-desc">${m.size ? (m.size / 1e9).toFixed(1) + ' GB' : 'Unknown size'}</div>
             </div>
             <i class="fa-solid fa-check mmo-chk"></i>
         </div>`,
@@ -3985,7 +3991,19 @@
         t.className = 'toast';
         t.textContent = msg;
         D.toasts.appendChild(t);
-        setTimeout(() => t.remove(), 2600);
+        let removed = false;
+        const remove = () => {
+          if (removed) return;
+          removed = true;
+          t.remove();
+        };
+        // Remove once the CSS fade-out actually finishes, rather than on a
+        // hardcoded timer that has to be kept in sync with the animation's
+        // duration + delay by hand.
+        t.addEventListener('animationend', (e) => {
+          if (e.animationName === 'toastOut') remove();
+        });
+        setTimeout(remove, 3000); // safety net if the animation doesn't fire
       }
 
       // ÔöÇÔöÇ Persistence ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
@@ -4050,6 +4068,12 @@
       }
 
       function gid() {
+        // crypto.randomUUID needs a secure context, which plain http:// over
+        // a LAN IP (rather than localhost) doesn't get, so keep the
+        // Math.random fallback for that case.
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+          return crypto.randomUUID();
+        }
         return (
           Date.now().toString(36) + Math.random().toString(36).substring(2, 8)
         );
