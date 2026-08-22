@@ -3279,9 +3279,34 @@
         D.imgStartOllama.disabled = true;
         D.chatEngineStatus.textContent = 'Starting...';
         try {
-          await fetch('/api/start-ollama', { method: 'POST' });
-          const started = await waitForEngineState(true);
-          toast(started ? 'Chat engine loaded.' : 'Chat engine start timed out.');
+          // This button always used to hit /api/start-ollama, which only
+          // ever starts Ollama. When the active engine is llama.cpp, that
+          // left llama.cpp never started and waitForEngineState(true) would
+          // poll d.llama (which stays false) until it timed out.
+          const statusR = await fetch('/api/engine-status');
+          const statusD = await statusR.json();
+
+          if (statusD.active_engine === 'llama') {
+            let model = '';
+            try {
+              const settingsR = await fetch('/api/settings');
+              const settingsD = await settingsR.json();
+              model = settingsD.llamaModel || '';
+            } catch {}
+            await fetch('/api/switch-engine', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ engine: 'llama', model, async: true }),
+            });
+            // llama.cpp startup can take up to ~2 minutes on CPU-only hosts,
+            // vs. Ollama's near-instant daemon start.
+            const started = await waitForEngineState(true, 125000);
+            toast(started ? 'Chat engine loaded.' : 'Chat engine start timed out.');
+          } else {
+            await fetch('/api/start-ollama', { method: 'POST' });
+            const started = await waitForEngineState(true);
+            toast(started ? 'Chat engine loaded.' : 'Chat engine start timed out.');
+          }
         } catch {
           toast('Failed to start chat engine.');
           await updateEngineStatus();
