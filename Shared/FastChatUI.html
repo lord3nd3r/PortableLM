@@ -3993,21 +3993,30 @@
       function save() {
         if (IS_SERVED) {
           clearTimeout(saveTimer);
-          saveTimer = setTimeout(
-            () =>
-              fetch('/api/chats', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(S.convs),
-              }).catch(() => {}),
-            800,
-          );
+          saveTimer = setTimeout(() => {
+            saveTimer = null;
+            fetch('/api/chats', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(S.convs),
+            }).catch(() => {});
+          }, 800);
         } else {
           try {
             localStorage.setItem('g-convs', JSON.stringify(S.convs));
           } catch (e) {}
         }
       }
+      // If the tab closes while a debounced save is still pending, flush it
+      // with a beacon so the last 800ms of chat state isn't lost.
+      window.addEventListener('beforeunload', () => {
+        if (IS_SERVED && saveTimer) {
+          clearTimeout(saveTimer);
+          saveTimer = null;
+          const blob = new Blob([JSON.stringify(S.convs)], { type: 'application/json' });
+          navigator.sendBeacon('/api/chats', blob);
+        }
+      });
       async function load() {
         if (IS_SERVED) {
           try {
@@ -4169,11 +4178,17 @@
       }
       
       // Poll engine startup progress
+      // Bumped each time pollEngineStartup() starts a new poll chain, so a
+      // stale chain (e.g. from a prior engine switch) cancels itself instead
+      // of continuing to run alongside a newer one.
+      let engineStartupPollToken = 0;
       async function pollEngineStartup(jobId) {
+        const myToken = ++engineStartupPollToken;
         const maxPolls = 150; // 150 * 1s = 2.5 minutes max
         let polls = 0;
-        
+
         const poll = async () => {
+          if (myToken !== engineStartupPollToken) return; // superseded, stop
           polls++;
           try {
             const r = await fetch(`/api/engine-startup-status?job_id=${jobId}`);
@@ -4278,11 +4293,14 @@
         });
       }
       
+      let modelPullPollToken = 0;
       async function pollModelPull(jobId) {
+        const myToken = ++modelPullPollToken;
         const maxPolls = 600; // 10 minutes
         let polls = 0;
-        
+
         const poll = async () => {
+          if (myToken !== modelPullPollToken) return; // superseded, stop
           polls++;
           try {
             const r = await fetch(`/api/pull-model-status?job_id=${jobId}`);
@@ -4365,11 +4383,14 @@
         });
       }
       
+      let hfDownloadPollToken = 0;
       async function pollHfDownload(jobId, type) {
+        const myToken = ++hfDownloadPollToken;
         const maxPolls = 1200; // 20 minutes for large models
         let polls = 0;
-        
+
         const poll = async () => {
+          if (myToken !== hfDownloadPollToken) return; // superseded, stop
           polls++;
           try {
             const r = await fetch(`/api/hf-download-status?job_id=${jobId}`);

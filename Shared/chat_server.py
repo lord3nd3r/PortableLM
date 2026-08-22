@@ -1604,8 +1604,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         safe_path = os.path.normpath(path.lstrip("/"))
         full_path = os.path.join(SCRIPT_DIR, safe_path)
 
-        # Security: don't allow path traversal
-        if not full_path.startswith(SCRIPT_DIR):
+        # Security: don't allow path traversal. Require the trailing separator
+        # so a sibling directory sharing SCRIPT_DIR's prefix (e.g. SCRIPT_DIR
+        # + "_secret") doesn't pass the check.
+        if not (full_path == SCRIPT_DIR or full_path.startswith(SCRIPT_DIR + os.sep)):
             self.send_response(403)
             self.end_headers()
             return
@@ -2227,8 +2229,14 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "URL required"}).encode())
             return
         
-        # Validate URL is from HuggingFace
-        if "huggingface.co" not in url and "hf.co" not in url:
+        # Validate URL is from HuggingFace. Parse the hostname rather than doing
+        # a substring check, which a URL like http://evil.com?x=huggingface.co
+        # or http://huggingface.co.evil.com would otherwise slip past.
+        parsed_url = urlparse(url)
+        hostname = (parsed_url.hostname or "").lower()
+        allowed_hosts = ("huggingface.co", "hf.co")
+        is_hf_host = any(hostname == h or hostname.endswith("." + h) for h in allowed_hosts)
+        if parsed_url.scheme not in ("http", "https") or not is_hf_host:
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
