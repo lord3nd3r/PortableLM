@@ -3016,17 +3016,26 @@
         }
       }
 
-      async function waitForEngineState(desiredOllamaState, maxWaitMs = 15000) {
+      async function waitForEngineState(desiredState, maxWaitMs = 15000) {
         const interval = 1000;
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
           try {
             const r = await fetch('/api/engine-status');
             const d = await r.json();
-            const ollamaModelLoaded = d.ollama_model_loaded !== undefined ? d.ollama_model_loaded : d.ollama;
-            if ((ollamaModelLoaded === desiredOllamaState || (!d.ollama && !desiredOllamaState)) && (!d.llama || !desiredOllamaState)) {
-              await updateEngineStatus();
-              return true;
+            if (desiredState) {
+              const activeEngine = d.active_engine || 'ollama';
+              const running = activeEngine === 'llama' ? d.llama : d.ollama;
+              if (running) {
+                await updateEngineStatus();
+                return true;
+              }
+            } else {
+              const ollamaModelLoaded = d.ollama_model_loaded !== undefined ? d.ollama_model_loaded : d.ollama;
+              if (!ollamaModelLoaded && !d.llama) {
+                await updateEngineStatus();
+                return true;
+              }
             }
           } catch {}
           await new Promise((res) => setTimeout(res, interval));
