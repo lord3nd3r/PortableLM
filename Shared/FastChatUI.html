@@ -3789,11 +3789,13 @@
       function renderMd(text) {
         if (!text) return '';
         
-        // Extract think blocks and replace with placeholders
+        // Extract think blocks and replace with HTML comment placeholders.
+        // HTML comments pass through marked unchanged, unlike __double_underscores__
+        // which marked interprets as bold/strong Markdown syntax.
         const thinkBlocks = [];
         let cleanedText = text.replace(/(<think>[\s\S]*?(?:<\/think>|$))/gi, (match) => {
           thinkBlocks.push(processThinkTags(match));
-          return `\n\n__THINK_PH_${thinkBlocks.length - 1}__\n\n`;
+          return `<!--THINKPH${thinkBlocks.length - 1}-->`;
         });
 
         let html = '';
@@ -3803,11 +3805,9 @@
           html = marked.parse(cleanedText, { breaks: true });
         }
 
-        // Restore think blocks
+        // Restore think blocks from HTML comment placeholders
         thinkBlocks.forEach((block, idx) => {
-          const ph = `__THINK_PH_${idx}__`;
-          html = html.replace(`<p>${ph}</p>`, block);
-          html = html.replace(ph, block);
+          html = html.replace(`<!--THINKPH${idx}-->`, block);
         });
 
         return html;
