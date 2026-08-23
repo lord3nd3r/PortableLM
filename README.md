@@ -10,7 +10,7 @@ them on your system or carry them with you across Windows, macOS, Linux, and And
 
 ## Core Features
 
-* **Zero Dependency Setup:** Ships with portable Python and isolated engine binaries. No system permissions, registry edits, or package managers required.
+* **No-Install Setup:** Self-contained engine binaries live on the drive. No admin rights, registry edits, package managers, or pip installs. The server itself is pure Python standard library — the only host requirement is **Python 3** (preinstalled on macOS and most Linux distros; on Windows the installer will tell you if it's missing).
 * **Cross-Platform:** Uses an intelligent `Shared` volume system — download your 5GB+ AI models *once*, and use them natively on Windows, macOS, Linux, and Android without duplication.
 * **Fully Offline:** Runs completely air-gapped after initial setup. Your data never leaves your machine. The install scripts vendor the UI's own JS/CSS/font dependencies (Markdown rendering, syntax highlighting, PDF parsing, icon fonts) into `Shared/vendor/` once, so the chat UI itself never phones home either.
 * **Network Proxied UI:** The custom Python HTTP server serves a blazing-fast dark/light mode chat UI. Access the AI from your phone or tablet on the same WiFi — no CORS headaches.
@@ -18,7 +18,10 @@ them on your system or carry them with you across Windows, macOS, Linux, and And
 * **Dual Chat Backends:** Switch between **Ollama** (multi-model, easy model management) and **llama.cpp** (lower latency, direct GGUF loading) from the settings panel without restarting.
 * **In-App Model Acquisition:** Pull any model from the Ollama library by name, or paste a direct HuggingFace `.gguf`/`.safetensors` URL — both download with a live progress bar, no terminal required.
 * **AI Image Generation:** Built-in Stable Diffusion image generation via stable-diffusion.cpp — same GPU acceleration, fully offline.
-* **File Attachments:** Drop in images (auto-detects whether your selected model supports vision), PDFs, or plain text files as chat context.
+* **Vision — It Can See:** Attach a photo and ask about it. Ships an optional vision model (Qwen2.5-VL 3B) so you can point a camera at a plant, a rash, a part, or a page and get an answer with no signal.
+* **Talk To It, It Talks Back:** Offline speech-to-text (whisper.cpp) and text-to-speech (piper). Dictate with the mic button, have replies read aloud, or both. No cloud, no API key.
+* **Tool Calling:** Ask "draw me a red barn at sunset" and the model calls the image engine itself, with progress and the result inline. A fixed allowlist of typed actions — never arbitrary commands.
+* **File Attachments:** Drop in images, PDFs, or plain text files as chat context.
 * **Reasoning-Model Aware:** Models that emit `<think>...</think>` reasoning traces (DeepSeek-R1-style) get their reasoning rendered in a collapsible "Thought Process" section instead of cluttering the reply.
 
 ---
@@ -26,7 +29,10 @@ them on your system or carry them with you across Windows, macOS, Linux, and And
 ## System Requirements
 
 - **Storage:** USB 3.0+ flash drive or SSD with at least **8 GB** free (16 GB recommended).
+  The optional voice engines add ~250 MB, and the vision model ~2.8 GB.
 - **RAM:** At least **8 GB** for 2–4B models, **16 GB** for 9–12B models.
+- **Python 3** on the host machine. Nothing is installed via pip — the server uses only
+  the standard library — but the interpreter itself must be present.
 
 ---
 
@@ -39,14 +45,13 @@ them on your system or carry them with you across Windows, macOS, Linux, and And
  ├── 📁 Mac        # Native macOS offline installers & launchers
  ├── 📁 Windows    # Native Windows offline automatic UI menus
  └── 📁 Shared     # Unified Data System
-      ├── 📁 bin         (Isolated executables: ollama, llama-server, sd image engine)
-      ├── 📁 chat_data   (Cross-platform persistent conversation history + settings.json)
-      ├── 📁 config      (models.json model catalog, vendor asset manifest)
+      ├── 📁 bin         (Isolated executables: ollama, llama-server, sd, piper, whisper)
+      ├── 📁 chat_data   (Conversation history, settings.json, generated images)
+      ├── 📁 config      (models.json catalog, vendor manifest, tool chat templates)
       ├── 📁 logs        (Rotating structured server log — see Logging below)
-      ├── 📁 models      (HuggingFace GGUF/safetensors weights, dropped in or downloaded)
+      ├── 📁 models      (GGUF/safetensors weights, plus voices/ and whisper/ subfolders)
       ├── 📁 scripts     (Shared installer helpers used by every platform's script)
-      ├── 📁 vendor      (Vendored offline copies of the UI's JS/CSS/font dependencies)
-      └── 📁 python      (Isolated portable python environment, where applicable)
+      └── 📁 vendor      (Vendored offline copies of the UI's JS/CSS/font dependencies)
 ```
 
 Every installer (Windows/Mac/Linux/Android) reads the **same**
@@ -68,6 +73,13 @@ desktop platforms (Windows/Mac/Linux):
 | 4 | **NemoMix Unleashed 12B** | ~7.0 GB | Heavyweight — needs 16GB+ RAM |
 | 5 | **Dolphin 2.9 Llama 3 8B** | ~4.9 GB | Uncensored, Llama-3-based |
 | 6 | **Phi-3.5 Mini 3.8B** | ~2.2 GB | Lightweight, standard (non-uncensored) tune |
+| 7 | **Qwen2.5-VL 3B (Vision)** | ~2.8 GB | **Sees images.** Attach a photo and ask about it. llama.cpp engine only |
+
+> **Why the vision model is llama.cpp only:** vision models ship as two files — the
+> language model and a separate `mmproj` projector — and llama-server loads the pair via
+> `--mmproj`. Importing a bare GGUF into Ollama can't attach the projector, so it would
+> look like it worked and then silently ignore every image. For vision under Ollama,
+> pull one by name instead (e.g. `qwen2.5vl:3b`) using the in-app model pull.
 
 Android gets its own lighter catalog (Gemma 2 2B, SmolLM2 1.7B, Qwen2.5 1.5B, Phi-3.5
 Mini, Qwen 3.5 9B for 12GB+ devices). Image generation ships with **CyberRealistic v3.3**
@@ -119,13 +131,67 @@ best GPU build for your hardware (CUDA / ROCm / Vulkan / CPU).
   into the visible answer — including while it's still streaming.
 - **File attachments:** images (with an automatic warning if your selected model isn't a
   vision model), PDFs (parsed client-side, no server upload), and plain text files.
-- **Message actions:** like/dislike rating, per-conversation history saved automatically.
+- **Message actions:** like/dislike rating, read aloud, per-conversation history saved
+  automatically.
 - **Model picker** shows each model's on-disk size and flags vision-capable models.
 - **Settings panel:** global system prompt, temperature, log verbosity
-  (`errors_only`/`all`), engine switch with live startup progress, model pull, and
-  HuggingFace direct download — all in one place.
+  (`errors_only`/`all`), engine switch with live startup progress, voice and speech
+  pace, tool calling, model pull, and HuggingFace direct download — all in one place.
 - **Image generation panel:** prompt/negative prompt, steps, CFG scale, resolution, seed,
   and sampler, with a live step-by-step progress bar and ETA.
+
+---
+
+## Voice & Tools
+
+All three run locally, with no cloud service and no API key.
+
+### Speaking to it
+
+The installer adds **whisper.cpp** plus the `base.en` model (~160 MB). A mic button
+appears in the message bar — click to record, click to stop, and the transcript is
+appended to whatever you've already typed. Transcription runs at roughly 3x realtime on
+CPU.
+
+> **Two limits worth knowing.** Browsers only expose the microphone in a *secure
+> context*, so dictation works on the machine running the server (`localhost` counts) but
+> **not from your phone over plain `http://` on the LAN** — the button is hidden there
+> rather than failing on click. And whisper.cpp publishes no macOS binary, so voice input
+> is unavailable on Mac unless you build `whisper-cli` yourself and drop it into
+> `Shared/bin/whisper-mac/`, which the server will pick up automatically.
+
+### It speaking back
+
+The installer adds **piper** plus a British English voice (~90 MB). Every assistant
+message gets a speaker button, and "Speak replies automatically" in settings turns it
+into a hands-free loop. Synthesis runs at roughly 7–11x realtime, so a long reply is
+spoken within a couple of seconds of finishing.
+
+Markup is stripped before speaking — reasoning traces are skipped, code blocks are
+announced rather than read character by character, and links keep their text but drop
+the URL.
+
+### Tool calling
+
+Off by default; enable it in the settings panel. Once on, asking for a picture makes the
+model call the image engine itself:
+
+> **You:** draw me a red barn at sunset
+> **Assistant:** *Generating image... step 12/20* → the image appears in the conversation
+
+| Engine | What's needed |
+|---|---|
+| **Ollama** | Nothing — takes effect immediately. Registry models ship tool-capable templates. |
+| **llama.cpp** | Re-apply the engine after toggling. llama-server picks its chat template at startup, and PortableLM supplies a tool-capable one (many abliterated GGUFs ship a stripped template with no tool support, which is why the model would otherwise never call anything). |
+
+Models that can't do tool calls keep chatting normally — the request is retried without
+tools rather than failing.
+
+**On safety:** the model can only invoke a fixed allowlist of typed actions (currently
+image generation). There is deliberately no generic "run this command" tool. This matters
+here specifically: the catalog ships abliterated models with refusal training removed,
+and dictated input is frequently misheard, so the worst outcome of a bad call should be a
+wrong picture — not a wrong shell command.
 
 ---
 
@@ -142,8 +208,10 @@ Run the install script for your OS:
 | **Linux** | `bash Linux/install.sh` |
 | **Android** | Open Termux -> `bash Android/install.sh` |
 
-> **Note:** This downloads the execution engines (Ollama, llama.cpp, and optionally the
-> Stable Diffusion binary) to `Shared/bin`, plus the UI's offline vendor assets.
+> **Note:** This downloads the execution engines to `Shared/bin` — Ollama, llama.cpp,
+> Stable Diffusion, and the optional voice engines (piper for speech, whisper for
+> dictation) — plus the UI's offline vendor assets. Each engine is skipped gracefully if
+> unavailable for your platform, so a failed optional download never blocks the install.
 
 ### Step 2: Download AI Models
 
@@ -254,6 +322,10 @@ terminal window additionally shows a live color-coded one-line summary per reque
 | "llama-server failed to start" | Port conflict or missing binary. Run the install script again to re-download the engine. |
 | SD image gen button greyed out | No image model found — pull/download one, or drop a `.safetensors` file into `Shared/models`. No restart needed; the server re-scans on every generation request. |
 | Image gen refuses to start with an Ollama model loaded | Expected — click "Unload" next to the chat engine status to free RAM, then try again. |
+| Attached a photo but the model ignored it | The model has to be a vision model. Install Qwen2.5-VL from the catalog (llama.cpp engine), or pull one under Ollama. The model picker shows an eye icon for vision-capable models. |
+| No mic button | Needs both the whisper engine installed and a secure browser context. Over plain `http://` on a LAN IP browsers block microphone access entirely, so it only appears on the machine running the server. Unavailable on macOS — no upstream whisper binary. |
+| No speaker button / voice settings missing | The piper engine or its voice isn't installed. Re-run the installer; a half-downloaded voice is deleted rather than offered. |
+| Asked for an image but got only text | Enable "Tool calling" in settings. On llama.cpp you must also re-apply the engine afterwards, since the tool-capable chat template is chosen when llama-server starts. |
 | Check what actually went wrong | Open `Shared/logs/chat_server.log` — every request and error is logged there with full context, regardless of the Log Mode setting. |
 
 ---
