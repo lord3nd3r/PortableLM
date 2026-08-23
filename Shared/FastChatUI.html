@@ -1160,6 +1160,26 @@
         line-height: 1.6;
         white-space: pre-wrap;
       }
+      /* Shown after an unclosed think block, i.e. generation was cut off
+         before the model reached an answer. */
+      .think-cutoff {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin: 0 0 12px 0;
+        padding: 10px 12px;
+        background: var(--bg2);
+        border: 1px solid var(--orange);
+        border-radius: 10px;
+        color: var(--t2);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .think-cutoff i {
+        color: var(--orange);
+        margin-top: 2px;
+        flex-shrink: 0;
+      }
       .msg-pdf-pill {
         display: inline-flex;
         align-items: center;
@@ -3820,10 +3840,24 @@
           if (!trimmed) return '';
           return `<details class="think-block"><summary><i class="fa-solid fa-brain"></i> Thought Process</summary><div class="think-content">${esc(trimmed)}</div></details>`;
         });
-        // Replace unclosed <think>... (streaming) with open details element
+        // Replace unclosed <think>... with an open details element.
+        // Mid-stream this just means "still thinking". Once the stream has
+        // ended, though, an unclosed tag means generation was cut off before
+        // the model ever emitted </think> and an answer — usually because a
+        // reasoning chain exhausted the context window. Everything the model
+        // produced is inside this block, so without a notice the message
+        // renders as a collapsed think block and nothing else, which reads as
+        // "it thought but never answered".
         processed = processed.replace(/<think>([\s\S]*?)$/gi, (_, thinkContent) => {
           const trimmed = thinkContent.trim();
-          return `<details class="think-block" open><summary><i class="fa-solid fa-brain"></i> Thinking...</summary><div class="think-content">${esc(trimmed)}</div></details>`;
+          const streaming = typeof S !== 'undefined' && S.streaming;
+          const summary = streaming
+            ? 'Thinking...'
+            : 'Thought Process (incomplete)';
+          const cutoffNotice = streaming
+            ? ''
+            : '<div class="think-cutoff"><i class="fa-solid fa-triangle-exclamation"></i> The model ran out of room while reasoning and never reached an answer. Try a shorter question or a smaller attachment.</div>';
+          return `<details class="think-block" open><summary><i class="fa-solid fa-brain"></i> ${summary}</summary><div class="think-content">${esc(trimmed)}</div></details>${cutoffNotice}`;
         });
         return processed;
       }
@@ -3840,11 +3874,36 @@
           return `<!--THINKPH${thinkBlocks.length - 1}-->`;
         });
 
+        // Escape everything except the placeholders, which must survive
+        // verbatim so the restore step below can find them. (Running esc()
+        // over the whole string would turn <!--THINKPH0--> into
+        // &lt;!--THINKPH0--&gt; and leak the raw placeholder to the user.)
+        const renderPlain = (s) =>
+          s
+            .split(/(<!--THINKPH\d+-->)/)
+            .map((part) =>
+              /^<!--THINKPH\d+-->$/.test(part)
+                ? part
+                : esc(part).replace(/\n/g, '<br>'),
+            )
+            .join('');
+
         let html = '';
         if (typeof marked === 'undefined') {
-          html = esc(cleanedText).replace(/\n/g, '<br>');
+          html = renderPlain(cleanedText);
         } else {
           html = marked.parse(cleanedText, { breaks: true });
+
+          // Markdown can silently delete content that looks like syntax but
+          // carries no body: a bare numeric answer such as "4." parses as an
+          // empty ordered list (<ol start="4"><li></li></ol>) and disappears
+          // entirely. If everything outside the think placeholders vanished,
+          // fall back to plain text so the answer is never lost.
+          const strip = (s) =>
+            s.replace(/<!--THINKPH\d+-->/g, '').replace(/<[^>]*>/g, '').trim();
+          if (strip(cleanedText) && !strip(html)) {
+            html = renderPlain(cleanedText);
+          }
         }
 
         // Restore think blocks from HTML comment placeholders

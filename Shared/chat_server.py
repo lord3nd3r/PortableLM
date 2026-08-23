@@ -2587,7 +2587,13 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                                 if "choices" in j and len(j["choices"]) > 0:
                                     delta = j["choices"][0].get("delta", {})
                                     out = {
-                                        "message": {"role": "assistant", "content": delta.get("content", "")},
+                                        # `or ""` rather than a .get() default: llama.cpp
+                                        # sends an explicit "content": null on some deltas
+                                        # (e.g. the opening role-only frame), and the key
+                                        # existing means .get()'s default never applies.
+                                        # Ollama's format always sends a string, so clients
+                                        # doing `content += chunk.message.content` break on null.
+                                        "message": {"role": "assistant", "content": delta.get("content") or ""},
                                         "done": False
                                     }
                                     try:
