@@ -1,0 +1,176 @@
+{
+  "base_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/",
+  "voices": [
+    {
+      "id": "en_GB-alan-medium",
+      "label": "English (Great Britain)",
+      "description": "British male, calm",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_GB/alan/medium/en_GB-alan-medium.onnx",
+      "config_path": "en/en_GB/alan/medium/en_GB-alan-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_GB-jenny_dioco-medium",
+      "label": "English (Great Britain)",
+      "description": "British female, warm",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx",
+      "config_path": "en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_GB-northern_english_male-medium",
+      "label": "English (Great Britain)",
+      "description": "Northern English male",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx",
+      "config_path": "en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_GB-cori-high",
+      "label": "English (Great Britain)",
+      "description": "British female, highest quality",
+      "quality": "high",
+      "size_mb": 114.2,
+      "onnx_path": "en/en_GB/cori/high/en_GB-cori-high.onnx",
+      "config_path": "en/en_GB/cori/high/en_GB-cori-high.onnx.json",
+      "onnx_bytes": 114219352
+    },
+    {
+      "id": "en_US-amy-medium",
+      "label": "English (United States)",
+      "description": "US female, clear",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_US/amy/medium/en_US-amy-medium.onnx",
+      "config_path": "en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_US-ryan-high",
+      "label": "English (United States)",
+      "description": "US male, highest quality",
+      "quality": "high",
+      "size_mb": 120.8,
+      "onnx_path": "en/en_US/ryan/high/en_US-ryan-high.onnx",
+      "config_path": "en/en_US/ryan/high/en_US-ryan-high.onnx.json",
+      "onnx_bytes": 120786792
+    },
+    {
+      "id": "en_US-hfc_male-medium",
+      "label": "English (United States)",
+      "description": "US male, neutral",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx",
+      "config_path": "en/en_US/hfc_male/medium/en_US-hfc_male-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_US-lessac-medium",
+      "label": "English (United States)",
+      "description": "US female, crisp",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+      "config_path": "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "en_US-danny-low",
+      "label": "English (United States)",
+      "description": "US male, smallest and fastest",
+      "quality": "low",
+      "size_mb": 63.1,
+      "onnx_path": "en/en_US/danny/low/en_US-danny-low.onnx",
+      "config_path": "en/en_US/danny/low/en_US-danny-low.onnx.json",
+      "onnx_bytes": 63104526
+    },
+    {
+      "id": "es_ES-davefx-medium",
+      "label": "Spanish (Spain)",
+      "description": "Spanish (Spain), male",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
+      "config_path": "es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "fr_FR-siwis-medium",
+      "label": "French (France)",
+      "description": "French, female",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx",
+      "config_path": "fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "de_DE-thorsten-medium",
+      "label": "German (Germany)",
+      "description": "German, male",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+      "config_path": "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "it_IT-paola-medium",
+      "label": "Italian (Italy)",
+      "description": "Italian, female",
+      "quality": "medium",
+      "size_mb": 63.5,
+      "onnx_path": "it/it_IT/paola/medium/it_IT-paola-medium.onnx",
+      "config_path": "it/it_IT/paola/medium/it_IT-paola-medium.onnx.json",
+      "onnx_bytes": 63511038
+    },
+    {
+      "id": "pt_BR-faber-medium",
+      "label": "Portuguese (Brazil)",
+      "description": "Portuguese (Brazil), male",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
+      "config_path": "pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "ru_RU-dmitri-medium",
+      "label": "Russian (Russia)",
+      "description": "Russian, male",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx",
+      "config_path": "ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "zh_CN-huayan-medium",
+      "label": "Chinese (China)",
+      "description": "Chinese (Mandarin), female",
+      "quality": "medium",
+      "size_mb": 63.2,
+      "onnx_path": "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx",
+      "config_path": "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json",
+      "onnx_bytes": 63201294
+    },
+    {
+      "id": "hi_IN-pratham-medium",
+      "label": "Hindi (India)",
+      "description": "Hindi, male",
+      "quality": "medium",
+      "size_mb": 63.5,
+      "onnx_path": "hi/hi_IN/pratham/medium/hi_IN-pratham-medium.onnx",
+      "config_path": "hi/hi_IN/pratham/medium/hi_IN-pratham-medium.onnx.json",
+      "onnx_bytes": 63516050
+    }
+  ],
+  "_comment": "Curated piper voices offered in the settings panel. Single-speaker only: multi-speaker models need a --speaker id the server does not pass. Sizes and paths come from rhasspy/piper-voices voices.json."
+}

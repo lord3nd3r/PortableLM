@@ -291,6 +291,103 @@ PIPER_VOICES_DIR = os.path.join(SCRIPT_DIR, "models", "voices")
 # through the background-job pattern used for image generation.
 TTS_MAX_CHARS = 4000
 
+VOICE_CATALOG_FILE = os.path.join(SCRIPT_DIR, "config", "voices.json")
+
+# Voice download job tracking, same shape as the other background jobs.
+VOICE_JOBS = {}
+VOICE_JOBS_LOCK = threading.RLock()
+
+def _register_voice_job(job_id, voice_id):
+    with VOICE_JOBS_LOCK:
+        VOICE_JOBS[job_id] = {
+            "status": "starting", "voice": voice_id, "progress_pct": 0,
+            "message": "Starting download...", "downloaded_bytes": 0,
+            "total_bytes": 0, "started_at": time.time(),
+            "updated_at": time.time(), "error": None,
+        }
+
+def _update_voice_job(job_id, **kwargs):
+    with VOICE_JOBS_LOCK:
+        if job_id in VOICE_JOBS:
+            VOICE_JOBS[job_id].update(kwargs)
+            VOICE_JOBS[job_id]["updated_at"] = time.time()
+
+def _get_voice_job(job_id):
+    with VOICE_JOBS_LOCK:
+        return VOICE_JOBS.get(job_id, {}).copy()
+
+def _load_voice_catalog():
+    """Curated list of downloadable voices, or empty if the catalog is missing."""
+    try:
+        with open(VOICE_CATALOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = data.get("base_url", "")
+        out = []
+        for v in data.get("voices", []):
+            if not v.get("id") or not v.get("onnx_path"):
+                continue
+            out.append({
+                "id": v["id"],
+                "label": v.get("label", ""),
+                "description": v.get("description", ""),
+                "quality": v.get("quality", ""),
+                "size_mb": v.get("size_mb", 0),
+                "onnx_url": base + v["onnx_path"],
+                "config_url": base + v.get("config_path", v["onnx_path"] + ".json"),
+                "onnx_bytes": v.get("onnx_bytes", 0),
+            })
+        return out
+    except Exception:
+        return []
+
+def _run_voice_download(job_id, entry):
+    """Fetch a voice's .onnx and .onnx.json into the voices folder."""
+    os.makedirs(PIPER_VOICES_DIR, exist_ok=True)
+    onnx_path = os.path.join(PIPER_VOICES_DIR, entry["id"] + ".onnx")
+    cfg_path = onnx_path + ".json"
+    try:
+        # Config first: it is tiny, and a voice whose .onnx exists without it is
+        # skipped by _find_piper_voices(), so this ordering never leaves a
+        # half-installed voice visible in the picker.
+        _update_voice_job(job_id, message="Fetching voice config...")
+        req = urllib.request.Request(entry["config_url"], headers={"User-Agent": "PortableLM/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(cfg_path, "wb") as f:
+            f.write(r.read())
+
+        _update_voice_job(job_id, message="Downloading voice...")
+        req = urllib.request.Request(entry["onnx_url"], headers={"User-Agent": "PortableLM/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            total = int(r.headers.get("Content-Length", 0)) or entry.get("onnx_bytes", 0)
+            _update_voice_job(job_id, total_bytes=total)
+            done = 0
+            last = 0.0
+            with open(onnx_path, "wb") as f:
+                while True:
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    now = time.time()
+                    if now - last > 0.5:
+                        pct = int(done / total * 100) if total else 0
+                        _update_voice_job(
+                            job_id, progress_pct=pct, downloaded_bytes=done,
+                            message=f"{_format_bytes(done)} / {_format_bytes(total)}",
+                        )
+                        last = now
+        if entry.get("onnx_bytes") and os.path.getsize(onnx_path) < entry["onnx_bytes"] * 0.9:
+            raise RuntimeError("Downloaded voice looks incomplete.")
+        _update_voice_job(job_id, status="complete", progress_pct=100, message="Voice installed!")
+    except Exception as e:
+        # Remove both halves so a failed download never leaves a broken voice.
+        for p in (onnx_path, cfg_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        _update_voice_job(job_id, status="failed", error=str(e))
+
 def _find_piper_voices():
     """Return every installed piper voice (.onnx paired with its .onnx.json)."""
     found = []
@@ -1981,6 +2078,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/tts-voices":
             self._get_tts_voices()
 
+        elif path == "/api/tts-voice-download-status":
+            self._get_voice_download_status()
+
         # Image generation progress API
         elif path == "/api/image-progress":
             self._get_image_progress()
@@ -2025,6 +2125,13 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         # Speech-to-text transcription
         elif path == "/api/stt":
             self._stt_endpoint()
+
+        # Voice library management
+        elif path == "/api/tts-voice-download":
+            self._voice_download_endpoint()
+
+        elif path == "/api/tts-voice-delete":
+            self._delete_voice_endpoint()
 
         # Engine control APIs
         elif path == "/api/stop-ollama":
@@ -2245,12 +2352,22 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
     # ── Text-to-Speech API ─────────────────────────────────────
     def _get_tts_voices(self):
-        """Return installed piper voices and whether TTS is usable at all."""
+        """Return installed piper voices, plus the catalog of downloadable ones."""
         voices = _find_piper_voices()
+        installed_ids = {v["id"] for v in voices}
+        catalog = [
+            {
+                "id": c["id"], "label": c["label"], "description": c["description"],
+                "quality": c["quality"], "size_mb": c["size_mb"],
+                "installed": c["id"] in installed_ids,
+            }
+            for c in _load_voice_catalog()
+        ]
         data = json.dumps({
             "tts_enabled": bool(PIPER_BINARY) and len(voices) > 0,
             "has_binary": bool(PIPER_BINARY),
             "voices": [{"id": v["id"], "name": v["name"], "file": v["file"]} for v in voices],
+            "catalog": catalog,
         })
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -2321,6 +2438,102 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(wav)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # client navigated away mid-playback
+
+    def _voice_download_endpoint(self):
+        """Start downloading a catalog voice in the background."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+
+        def fail(code, message):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": message}).encode())
+
+        voice_id = str(payload.get("voice", "") or "")
+        # Only ids present in the bundled catalog are accepted, so the id can
+        # never steer the download URL or the destination path.
+        entry = next((c for c in _load_voice_catalog() if c["id"] == voice_id), None)
+        if not entry:
+            fail(400, "Unknown voice.")
+            return
+        if os.path.isfile(os.path.join(PIPER_VOICES_DIR, entry["id"] + ".onnx")):
+            fail(409, "That voice is already installed.")
+            return
+
+        job_id = str(uuid.uuid4())
+        _register_voice_job(job_id, entry["id"])
+        threading.Thread(target=_run_voice_download, args=(job_id, entry), daemon=True).start()
+
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": True, "job_id": job_id, "voice": entry["id"]}).encode())
+
+    def _get_voice_download_status(self):
+        query = parse_qs(urlparse(self.path).query)
+        job_id = query.get("job_id", [None])[0]
+        job = _get_voice_job(job_id) if job_id else {}
+        if not job:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Job not found"}).encode())
+            return
+        resp = {
+            "status": job.get("status"), "voice": job.get("voice"),
+            "progress_pct": job.get("progress_pct", 0),
+            "message": job.get("message", ""),
+        }
+        if job.get("status") == "failed":
+            resp["error"] = job.get("error", "Unknown error")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(resp).encode())
+
+    def _delete_voice_endpoint(self):
+        """Remove an installed voice. Voices are ~63 MB each on a portable drive."""
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+
+        def respond(code, obj):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(obj).encode())
+
+        # basename() plus a match against installed voices keeps this from
+        # deleting anything outside the voices folder.
+        voice_id = os.path.basename(str(payload.get("voice", "") or ""))
+        installed = _find_piper_voices()
+        match = next((v for v in installed if v["id"] == voice_id), None)
+        if not match:
+            respond(404, {"error": "Voice not installed."})
+            return
+        if len(installed) <= 1:
+            respond(409, {"error": "That's the only voice installed — read-aloud would stop working."})
+            return
+        try:
+            os.remove(match["path"])
+            cfg = match["path"] + ".json"
+            if os.path.isfile(cfg):
+                os.remove(cfg)
+        except Exception as e:
+            respond(500, {"error": str(e)})
+            return
+        respond(200, {"ok": True, "voice": voice_id})
 
     # ── Speech-to-Text API ─────────────────────────────────────
     def _stt_endpoint(self):

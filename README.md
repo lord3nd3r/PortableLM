@@ -167,6 +167,13 @@ message gets a speaker button, and "Speak replies automatically" in settings tur
 into a hands-free loop. Synthesis runs at roughly 7–11x realtime, so a long reply is
 spoken within a couple of seconds of finishing.
 
+**More voices** are available from the settings panel — 17 curated options covering
+British, Northern English and American accents in both genders, plus Spanish, French,
+German, Italian, Portuguese, Russian, Mandarin and Hindi. Pick one and hit Download
+(~63 MB each, ~120 MB for the high-quality ones) with a live progress bar; Remove frees
+the space again. Everything is fetched from the same offline-capable piper voice library,
+and the last remaining voice can't be removed, so read-aloud never breaks itself.
+
 Markup is stripped before speaking — reasoning traces are skipped, code blocks are
 announced rather than read character by character, and links keep their text but drop
 the URL.

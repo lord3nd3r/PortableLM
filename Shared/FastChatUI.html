@@ -2397,6 +2397,15 @@
             </div>
           </div>
           <div class="sys-row">
+            <label for="voice-catalog">Voice library</label>
+            <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+              <select id="voice-catalog" class="sys-select"></select>
+              <button class="sys-btn primary" id="voice-get-btn">Download</button>
+              <button class="sys-btn secondary" id="voice-del-btn">Remove</button>
+              <span class="sys-hint" id="voice-dl-status"></span>
+            </div>
+          </div>
+          <div class="sys-row">
             <label for="tts-rate">Speech pace</label>
             <div class="sys-subrow" style="align-items:center;gap:8px;">
               <input type="range" id="tts-rate" min="0.6" max="1.6" step="0.05" style="flex:1;max-width:220px;" />
@@ -4473,6 +4482,7 @@
           const d = await r.json();
           S.ttsEnabled = !!d.tts_enabled;
           S.ttsVoices = d.voices || [];
+          S.voiceCatalog = d.catalog || [];
           // Drop a saved voice that is no longer installed, so we fall back to
           // the server's default instead of erroring on every request.
           if (S.ttsVoice && !S.ttsVoices.some((v) => v.id === S.ttsVoice)) {
@@ -4493,16 +4503,31 @@
           return;
         }
         wrap.style.display = 'block';
+        // Rebuilt on every refresh (not cached) so a newly downloaded or
+        // removed voice shows up immediately.
         const sel = document.getElementById('tts-voice-select');
-        if (sel && !sel.dataset.filled) {
+        if (sel) {
+          const keep = S.ttsVoice || sel.value;
           sel.innerHTML = S.ttsVoices
             .map(
               (v) =>
-                `<option value="${esc(v.id)}"${v.id === S.ttsVoice ? ' selected' : ''}>${esc(v.name)}</option>`,
+                `<option value="${esc(v.id)}"${v.id === keep ? ' selected' : ''}>${esc(v.name)}</option>`,
             )
             .join('');
-          sel.dataset.filled = '1';
         }
+
+        const cat = document.getElementById('voice-catalog');
+        if (cat) {
+          const keep = cat.value;
+          cat.innerHTML = (S.voiceCatalog || [])
+            .map((c) => {
+              const mark = c.installed ? '✓ ' : '';
+              const size = c.installed ? 'installed' : `${c.size_mb} MB`;
+              return `<option value="${esc(c.id)}"${c.id === keep ? ' selected' : ''}>${mark}${esc(c.description || c.id)} — ${esc(c.label)} (${size})</option>`;
+            })
+            .join('');
+        }
+        syncVoiceButtons();
         const auto = document.getElementById('tts-auto');
         if (auto) auto.checked = S.ttsAuto;
         const rate = document.getElementById('tts-rate');
@@ -4510,6 +4535,90 @@
         if (rate) rate.value = S.ttsRate;
         // length_scale is inverse: higher stretches phonemes, i.e. slower.
         if (rateVal) rateVal.textContent = `${S.ttsRate.toFixed(2)}x length`;
+      }
+
+      // Download/Remove are mutually exclusive per voice, so reflect which one
+      // applies to the current selection instead of letting the user click the
+      // wrong one and get an error.
+      function syncVoiceButtons() {
+        const cat = document.getElementById('voice-catalog');
+        const get = document.getElementById('voice-get-btn');
+        const del = document.getElementById('voice-del-btn');
+        if (!cat || !get || !del) return;
+        const entry = (S.voiceCatalog || []).find((c) => c.id === cat.value);
+        const installed = !!entry?.installed;
+        get.style.display = installed ? 'none' : 'inline-block';
+        // Removing the only installed voice would disable read-aloud entirely.
+        del.style.display =
+          installed && (S.ttsVoices || []).length > 1 ? 'inline-block' : 'none';
+      }
+
+      async function downloadVoice() {
+        const cat = document.getElementById('voice-catalog');
+        const status = document.getElementById('voice-dl-status');
+        const btn = document.getElementById('voice-get-btn');
+        if (!cat?.value) return;
+        btn.disabled = true;
+        status.textContent = 'Starting...';
+        try {
+          const r = await fetch('/api/tts-voice-download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice: cat.value }),
+          });
+          const d = await r.json();
+          if (!r.ok) {
+            status.textContent = d.error || 'Failed.';
+            btn.disabled = false;
+            return;
+          }
+          for (let i = 0; i < 900; i++) {
+            await new Promise((res) => setTimeout(res, 1000));
+            const pr = await fetch(
+              `/api/tts-voice-download-status?job_id=${encodeURIComponent(d.job_id)}`,
+            );
+            const pd = await pr.json();
+            if (pd.status === 'complete') {
+              status.textContent = 'Installed.';
+              await loadTtsVoices(); // refresh both dropdowns
+              break;
+            }
+            if (pd.status === 'failed') {
+              status.textContent = pd.error || 'Download failed.';
+              break;
+            }
+            status.textContent = `${pd.progress_pct || 0}% — ${pd.message || ''}`;
+          }
+        } catch {
+          status.textContent = 'Download failed.';
+        }
+        btn.disabled = false;
+      }
+
+      async function removeVoice() {
+        const cat = document.getElementById('voice-catalog');
+        const status = document.getElementById('voice-dl-status');
+        if (!cat?.value) return;
+        status.textContent = 'Removing...';
+        try {
+          const r = await fetch('/api/tts-voice-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice: cat.value }),
+          });
+          const d = await r.json();
+          status.textContent = r.ok ? 'Removed.' : d.error || 'Could not remove.';
+          if (r.ok) {
+            // If the active voice was the one removed, fall back to the server default.
+            if (S.ttsVoice === cat.value) {
+              S.ttsVoice = '';
+              localStorage.removeItem('ttsVoice');
+            }
+            await loadTtsVoices();
+          }
+        } catch {
+          status.textContent = 'Could not remove.';
+        }
       }
 
       // One shared player: starting new speech always replaces whatever was
@@ -4853,6 +4962,13 @@
           if (!S.ttsAuto) stopSpeaking();
         });
       }
+      const voiceCat = document.getElementById('voice-catalog');
+      if (voiceCat) voiceCat.addEventListener('change', syncVoiceButtons);
+      const voiceGetBtn = document.getElementById('voice-get-btn');
+      if (voiceGetBtn) voiceGetBtn.addEventListener('click', downloadVoice);
+      const voiceDelBtn = document.getElementById('voice-del-btn');
+      if (voiceDelBtn) voiceDelBtn.addEventListener('click', removeVoice);
+
       const ttsRateInput = document.getElementById('tts-rate');
       if (ttsRateInput) {
         ttsRateInput.addEventListener('input', () => {
