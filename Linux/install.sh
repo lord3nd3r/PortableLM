@@ -799,6 +799,80 @@ else
 fi
 
 # ================================================================
+# STEP 6f: Download whisper.cpp speech-to-text engine + model
+# ================================================================
+echo ""
+echo -e "${YLW}[6f/7] Downloading speech-to-text engine (optional, ~160 MB)...${RST}"
+
+WHISPER_DIR="$SHARED_BIN/whisper-linux"
+WHISPER_BIN="$WHISPER_DIR/whisper-cli"
+WHISPER_REL="b4938"
+WHISPER_MODELS_DIR="$MODELS_DIR/whisper"
+# base.en balances accuracy against speed for short spoken commands; tiny.en
+# is faster but noticeably worse on proper nouns.
+WHISPER_MODEL="ggml-base.en.bin"
+WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${WHISPER_MODEL}"
+
+case "$(uname -m)" in
+    x86_64)        WHISPER_ARCH="ubuntu-x64" ;;
+    aarch64|arm64) WHISPER_ARCH="ubuntu-arm64" ;;
+    *)             WHISPER_ARCH="" ;;
+esac
+
+if [ -z "$WHISPER_ARCH" ]; then
+    echo -e "${YLW}      No whisper build for $(uname -m) - skipping speech-to-text.${RST}"
+else
+    if [ -f "$WHISPER_BIN" ] && file_ok "$WHISPER_BIN" 100000; then
+        echo -e "${GRN}      whisper already installed! Skipping...${RST}"
+    else
+        mkdir -p "$WHISPER_DIR"
+        WHISPER_TMP="$SHARED_BIN/whisper.tar.gz"
+        echo -e "      Downloading whisper (${WHISPER_ARCH})..."
+        curl -L --fail "https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_REL}/whisper-bin-${WHISPER_ARCH}.tar.gz" -o "$WHISPER_TMP"
+        if [ -f "$WHISPER_TMP" ]; then
+            WHISPER_EXTRACT="$SHARED_BIN/whisper-tmp"
+            rm -rf "$WHISPER_EXTRACT"; mkdir -p "$WHISPER_EXTRACT"
+            tar -xzf "$WHISPER_TMP" -C "$WHISPER_EXTRACT" 2>/dev/null || true
+            rm -f "$WHISPER_TMP"
+            # Copy only the CLI and its shared libraries; the archive also
+            # carries bench/test binaries that are dead weight on a USB stick.
+            SRC=$(find "$WHISPER_EXTRACT" -name "whisper-cli" -type f | head -n 1)
+            if [ -n "$SRC" ]; then
+                SRCDIR=$(dirname "$SRC")
+                cp "$SRC" "$WHISPER_DIR"/ 2>/dev/null || true
+                cp "$SRCDIR"/*.so* "$WHISPER_DIR"/ 2>/dev/null || true
+                chmod +x "$WHISPER_BIN" 2>/dev/null || true
+            fi
+            rm -rf "$WHISPER_EXTRACT"
+            if [ -f "$WHISPER_BIN" ]; then
+                echo -e "${GRN}      whisper installed!${RST}"
+            else
+                echo -e "${YLW}      WARNING: whisper-cli not found after extraction. Voice input will be unavailable.${RST}"
+            fi
+        else
+            echo -e "${YLW}      WARNING: whisper download failed. Voice input will be unavailable.${RST}"
+        fi
+    fi
+
+    # Speech model (only worth fetching if the binary is actually present)
+    if [ -f "$WHISPER_BIN" ]; then
+        mkdir -p "$WHISPER_MODELS_DIR"
+        if file_ok "$WHISPER_MODELS_DIR/$WHISPER_MODEL" 100000000; then
+            echo -e "${GRN}      Speech model already downloaded! Skipping...${RST}"
+        else
+            echo -e "      Downloading ${WHISPER_MODEL} (~148 MB)..."
+            curl -L --fail "$WHISPER_MODEL_URL" -o "$WHISPER_MODELS_DIR/$WHISPER_MODEL"
+            if file_ok "$WHISPER_MODELS_DIR/$WHISPER_MODEL" 100000000; then
+                echo -e "${GRN}      Speech model installed!${RST}"
+            else
+                rm -f "$WHISPER_MODELS_DIR/$WHISPER_MODEL"
+                echo -e "${YLW}      WARNING: speech model download failed. Voice input will be unavailable.${RST}"
+            fi
+        fi
+    fi
+fi
+
+# ================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # ================================================================
 echo ""

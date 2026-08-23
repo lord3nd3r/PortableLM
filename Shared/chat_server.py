@@ -311,6 +311,101 @@ def _find_piper_voices():
             })
     return found
 
+# ── Speech-to-Text (whisper.cpp) ───────────────────────────────
+def _find_whisper_binary():
+    """Locate the whisper.cpp CLI for this platform.
+
+    Upstream publishes prebuilt binaries for Linux and Windows only; on macOS
+    this stays None unless the user drops a self-built whisper-cli into
+    Shared/bin/whisper-mac/, which is picked up here automatically.
+    """
+    plat = platform.system()
+    bin_dir = os.path.join(SCRIPT_DIR, "bin")
+    if plat == "Windows":
+        candidates = [os.path.join(bin_dir, "whisper-windows", "whisper-cli.exe"),
+                      os.path.join(bin_dir, "whisper-windows", "main.exe")]
+    elif plat == "Linux":
+        candidates = [os.path.join(bin_dir, "whisper-linux", "whisper-cli"),
+                      os.path.join(bin_dir, "whisper-linux", "main")]
+    else:  # Darwin / macOS
+        candidates = [os.path.join(bin_dir, "whisper-mac", "whisper-cli"),
+                      os.path.join(bin_dir, "whisper-mac", "main")]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+WHISPER_BINARY = _find_whisper_binary()
+WHISPER_MODELS_DIR = os.path.join(SCRIPT_DIR, "models", "whisper")
+# Uploaded audio is short spoken input, not a file transfer. 25 MB is roughly
+# 13 minutes of 16 kHz mono PCM — far more than any single utterance needs.
+STT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+def _find_whisper_models():
+    """Return installed whisper ggml model files, smallest (fastest) first."""
+    found = []
+    if os.path.isdir(WHISPER_MODELS_DIR):
+        for fname in sorted(os.listdir(WHISPER_MODELS_DIR)):
+            if not fname.lower().endswith(".bin"):
+                continue
+            path = os.path.join(WHISPER_MODELS_DIR, fname)
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                continue
+            found.append({"file": fname, "path": path, "size": size})
+    found.sort(key=lambda m: m["size"])
+    return found
+
+def _transcribe_audio(wav_bytes, model_path):
+    """Run whisper.cpp over WAV bytes and return the transcript. Raises on failure."""
+    if not WHISPER_BINARY or not os.path.isfile(WHISPER_BINARY):
+        raise RuntimeError("Speech recognition engine not installed. Please run the installer.")
+    if not model_path or not os.path.isfile(model_path):
+        raise RuntimeError("No speech recognition model found. Please run the installer.")
+
+    bin_dir = os.path.dirname(os.path.abspath(WHISPER_BINARY))
+    env = os.environ.copy()
+    if platform.system() != "Windows":
+        key = "DYLD_LIBRARY_PATH" if platform.system() == "Darwin" else "LD_LIBRARY_PATH"
+        existing = env.get(key, "")
+        env[key] = bin_dir + ((os.pathsep + existing) if existing else "")
+
+    tmp_dir = os.path.join(SCRIPT_DIR, "chat_data", "stt_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    in_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.wav")
+    try:
+        with open(in_path, "wb") as f:
+            f.write(wav_bytes)
+        cmd = [
+            WHISPER_BINARY,
+            "--model", model_path,
+            "--file", in_path,
+            "--language", "en",
+            "--no-timestamps",
+            "--no-prints",
+            "--threads", str(max(1, min(8, (os.cpu_count() or 4)))),
+        ]
+        proc = subprocess.run(cmd, env=env, capture_output=True, timeout=300)
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", errors="ignore").strip()[:200]
+            raise RuntimeError(f"Transcription failed. {detail}")
+        # With --no-prints, whisper writes only the transcript to stdout;
+        # progress and backend chatter go to stderr.
+        text = proc.stdout.decode("utf-8", errors="ignore").strip()
+        # Whisper marks non-speech with bracketed all-caps tokens such as
+        # [BLANK_AUDIO], [ SILENCE ] or [MUSIC]. Only all-caps bracketed runs
+        # are stripped: matching loosely (or inside parentheses) would delete
+        # real speech like "(that sounds good)", and leaving a stray marker in
+        # is far less damaging than dropping words the user actually said.
+        text = re.sub(r"\[\s*[A-Z][A-Z0-9_ ]*\s*\]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+    finally:
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
+
 def _text_for_speech(text):
     """Strip markup from model output so it reads naturally aloud.
 
@@ -1872,6 +1967,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/tts":
             self._tts_endpoint()
 
+        # Speech-to-text transcription
+        elif path == "/api/stt":
+            self._stt_endpoint()
+
         # Engine control APIs
         elif path == "/api/stop-ollama":
             self._stop_ollama_endpoint()
@@ -2168,6 +2267,59 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # client navigated away mid-playback
 
+    # ── Speech-to-Text API ─────────────────────────────────────
+    def _stt_endpoint(self):
+        """Transcribe uploaded WAV audio and return the recognized text.
+
+        The body is raw audio/wav rather than a multipart form: the stdlib has
+        no maintained multipart parser (cgi was removed in 3.13) and a single
+        binary body needs none.
+        """
+        request_context = self._build_request_context("/api/stt")
+
+        def fail(code, message):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": message}).encode())
+
+        length = _safe_int(self.headers.get("Content-Length"), 0)
+        if length <= 0:
+            fail(400, "No audio received.")
+            return
+        if length > STT_MAX_UPLOAD_BYTES:
+            fail(413, "Recording is too long.")
+            return
+
+        audio = self.rfile.read(length)
+        # whisper.cpp decodes WAV via miniaudio; browser-native formats such as
+        # webm/opus are rejected outright, so catch that here with a clear
+        # message instead of a confusing engine error.
+        if not (audio[:4] == b"RIFF" and audio[8:12] == b"WAVE"):
+            fail(400, "Audio must be WAV format.")
+            return
+
+        models = _find_whisper_models()
+        if not models:
+            fail(503, "No speech recognition model installed. Please run the installer.")
+            return
+
+        try:
+            text = _transcribe_audio(audio, models[0]["path"])
+        except Exception as e:
+            _log_event(logging.ERROR, "Transcription failed",
+                       request_context=request_context, exc_info=True)
+            fail(500, str(e))
+            return
+
+        _log_event(logging.INFO, "Audio transcribed", request_context=request_context)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps({"text": text}).encode())
+
     def _get_engine_status(self):
         """Return which engines are currently running."""
         ollama_up = _is_ollama_running()
@@ -2189,6 +2341,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             "sd_healthy": _test_sd_binary(),
             "sd_backend": SD_BACKEND or "cpu",
             "tts_enabled": bool(PIPER_BINARY) and len(_find_piper_voices()) > 0,
+            "stt_enabled": bool(WHISPER_BINARY) and len(_find_whisper_models()) > 0,
         })
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

@@ -846,6 +846,69 @@ if (Test-Path $PiperExe) {
 }
 
 # =================================================================
+# STEP 6f: Download whisper.cpp speech-to-text engine + model
+# =================================================================
+Write-Host ""
+Write-Host "[6f/7] Downloading speech-to-text engine (optional, ~160 MB)..." -ForegroundColor Yellow
+
+$WhisperDir    = "$USB_Drive\Shared\bin\whisper-windows"
+$WhisperExe    = "$WhisperDir\whisper-cli.exe"
+$WhisperURL    = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip"
+$WhisperZip    = "$USB_Drive\Shared\bin\whisper-windows.zip"
+$WhisperModels = "$USB_Drive\Shared\models\whisper"
+# base.en balances accuracy against speed for short spoken commands.
+$WhisperModel  = "ggml-base.en.bin"
+$WhisperModelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$WhisperModel"
+
+if (Test-Path $WhisperExe) {
+    Write-Host "      whisper already installed! Skipping..." -ForegroundColor Green
+} else {
+    New-Item -ItemType Directory -Force -Path $WhisperDir | Out-Null
+    curl.exe -L --ssl-no-revoke --progress-bar $WhisperURL -o $WhisperZip
+    if (Test-Path $WhisperZip) {
+        $tempWhisper = "$USB_Drive\Shared\bin\whisper-tmp"
+        if (Test-Path $tempWhisper) { Remove-Item -Recurse -Force $tempWhisper }
+        Expand-Archive -Path $WhisperZip -DestinationPath $tempWhisper -Force
+        # Copy only the CLI and its DLLs; the archive also carries bench/test
+        # binaries that are dead weight on a USB stick.
+        $cli = Get-ChildItem -Path $tempWhisper -Recurse -Filter "whisper-cli.exe" | Select-Object -First 1
+        if ($cli) {
+            Copy-Item -Path $cli.FullName -Destination $WhisperDir -Force
+            Get-ChildItem -Path $cli.DirectoryName -Filter "*.dll" | ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination $WhisperDir -Force
+            }
+        }
+        Remove-Item -Recurse -Force $tempWhisper -ErrorAction SilentlyContinue
+        Remove-Item $WhisperZip -Force -ErrorAction SilentlyContinue
+        if (Test-Path $WhisperExe) {
+            Write-Host "      whisper installed!" -ForegroundColor Green
+        } else {
+            Write-Host "      WARNING: whisper-cli.exe not found after extraction. Voice input will be unavailable." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "      WARNING: whisper download failed. Voice input will be unavailable." -ForegroundColor Yellow
+    }
+}
+
+# Speech model (only worth fetching if the binary is actually present)
+if (Test-Path $WhisperExe) {
+    New-Item -ItemType Directory -Force -Path $WhisperModels | Out-Null
+    $modelPath = "$WhisperModels\$WhisperModel"
+    if (Test-DownloadedFile -Path $modelPath -MinSize 100000000) {
+        Write-Host "      Speech model already downloaded! Skipping..." -ForegroundColor Green
+    } else {
+        Write-Host "      Downloading $WhisperModel (~148 MB)..." -ForegroundColor Magenta
+        curl.exe -L --ssl-no-revoke --progress-bar $WhisperModelURL -o $modelPath
+        if (Test-DownloadedFile -Path $modelPath -MinSize 100000000) {
+            Write-Host "      Speech model installed!" -ForegroundColor Green
+        } else {
+            Remove-Item $modelPath -Force -ErrorAction SilentlyContinue
+            Write-Host "      WARNING: speech model download failed. Voice input will be unavailable." -ForegroundColor Yellow
+        }
+    }
+}
+
+# =================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # =================================================================
 Write-Host ""

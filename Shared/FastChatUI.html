@@ -1623,6 +1623,25 @@
         background: var(--bgh);
         color: var(--t1);
       }
+      /* Actively recording — pulses so it's obvious the mic is live. */
+      #mic-btn.rec {
+        color: var(--red);
+        background: var(--bgh);
+        animation: micPulse 1.2s ease-in-out infinite;
+      }
+      #mic-btn:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      @keyframes micPulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.45;
+        }
+      }
 
       /* Send button */
       .sbtn {
@@ -2550,6 +2569,16 @@
                   multiple
                   accept="image/*,.pdf,application/pdf,.txt,.md"
                 />
+                <!-- Hidden until the server reports a whisper binary + model -->
+                <button
+                  class="ib2"
+                  id="mic-btn"
+                  aria-label="Dictate message"
+                  title="Hold to dictate"
+                  style="display:none"
+                >
+                  <i class="fa-solid fa-microphone"></i>
+                </button>
                 <button
                   class="ib2 sbtn"
                   id="send-btn"
@@ -2751,6 +2780,9 @@
       ttsRate: parseFloat(localStorage.getItem('ttsRate')) || 1.0,
       ttsAuto: localStorage.getItem('ttsAuto') === '1',
 
+      // Speech to text (discovered from the server at startup)
+      sttEnabled: false,
+
         // Attachments (multi-file)
         attachments: [],
       };
@@ -2840,6 +2872,7 @@
 
         await loadGlobalPrompt();
         await loadTtsVoices();
+        await loadSttCapability();
         await fetchModels();
         await load();
 
@@ -4076,6 +4109,182 @@
           navigator.clipboard.writeText(m.content).then(() => toast('Copied'));
       }
 
+      // ── Speech to text ───────────────────────────────────────
+      // getUserMedia only exists in a secure context. Served over plain http
+      // from a LAN IP (the phone-on-the-couch case) browsers withhold it
+      // entirely, so the mic is hidden rather than left to fail on click.
+      const MIC_AVAILABLE = !!(
+        navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+      );
+
+      async function loadSttCapability() {
+        if (!IS_SERVED) return;
+        try {
+          const r = await fetch('/api/engine-status');
+          const d = await r.json();
+          S.sttEnabled = !!d.stt_enabled;
+        } catch {
+          S.sttEnabled = false;
+        }
+        const btn = document.getElementById('mic-btn');
+        if (btn) {
+          // Needs both the server engine and a secure browser context.
+          btn.style.display = S.sttEnabled && MIC_AVAILABLE ? 'flex' : 'none';
+        }
+      }
+
+      let micRecorder = null;
+      let micChunks = [];
+      let micStream = null;
+      let micBusy = false;
+
+      // whisper.cpp decodes WAV only — it rejects the webm/opus that
+      // MediaRecorder produces — so convert in the browser. decodeAudioData
+      // handles the opus, and OfflineAudioContext downmixes to mono and
+      // resamples to whisper's native 16 kHz (which also shrinks the upload).
+      function encodeWav16(samples, rate) {
+        const buf = new ArrayBuffer(44 + samples.length * 2);
+        const v = new DataView(buf);
+        const put = (off, str) => {
+          for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i));
+        };
+        put(0, 'RIFF');
+        v.setUint32(4, 36 + samples.length * 2, true);
+        put(8, 'WAVE');
+        put(12, 'fmt ');
+        v.setUint32(16, 16, true); // PCM chunk size
+        v.setUint16(20, 1, true); // format = PCM
+        v.setUint16(22, 1, true); // mono
+        v.setUint32(24, rate, true);
+        v.setUint32(28, rate * 2, true); // byte rate
+        v.setUint16(32, 2, true); // block align
+        v.setUint16(34, 16, true); // bits per sample
+        put(36, 'data');
+        v.setUint32(40, samples.length * 2, true);
+        let o = 44;
+        for (let i = 0; i < samples.length; i++) {
+          const s = Math.max(-1, Math.min(1, samples[i]));
+          v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+          o += 2;
+        }
+        return new Blob([buf], { type: 'audio/wav' });
+      }
+
+      async function blobToWav16k(blob) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AC();
+        let decoded;
+        try {
+          decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+        } finally {
+          ctx.close();
+        }
+        const rate = 16000;
+        const frames = Math.max(1, Math.ceil(decoded.duration * rate));
+        const off = new OfflineAudioContext(1, frames, rate);
+        const src = off.createBufferSource();
+        src.buffer = decoded;
+        src.connect(off.destination);
+        src.start();
+        const rendered = await off.startRendering();
+        return encodeWav16(rendered.getChannelData(0), rate);
+      }
+
+      function setMicState(state) {
+        const btn = document.getElementById('mic-btn');
+        if (!btn) return;
+        btn.classList.toggle('rec', state === 'recording');
+        btn.disabled = state === 'busy';
+        btn.innerHTML =
+          state === 'recording'
+            ? '<i class="fa-solid fa-stop"></i>'
+            : state === 'busy'
+              ? '<i class="fa-solid fa-spinner fa-spin"></i>'
+              : '<i class="fa-solid fa-microphone"></i>';
+        btn.title =
+          state === 'recording' ? 'Stop and transcribe' : 'Dictate message';
+      }
+
+      async function startDictation() {
+        if (micBusy || micRecorder) return;
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch {
+          toast('Microphone permission denied.');
+          return;
+        }
+        micChunks = [];
+        try {
+          micRecorder = new MediaRecorder(micStream);
+        } catch {
+          toast('Recording is not supported in this browser.');
+          stopMicStream();
+          return;
+        }
+        micRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size) micChunks.push(e.data);
+        };
+        micRecorder.onstop = () => finishDictation();
+        micRecorder.start();
+        setMicState('recording');
+        // Speaking and listening at once would transcribe our own voice.
+        stopSpeaking();
+      }
+
+      function stopMicStream() {
+        if (micStream) {
+          micStream.getTracks().forEach((t) => t.stop());
+          micStream = null;
+        }
+      }
+
+      function stopDictation() {
+        if (micRecorder && micRecorder.state !== 'inactive') micRecorder.stop();
+      }
+
+      async function finishDictation() {
+        const chunks = micChunks;
+        micChunks = [];
+        micRecorder = null;
+        stopMicStream();
+        if (!chunks.length) {
+          setMicState('idle');
+          return;
+        }
+        micBusy = true;
+        setMicState('busy');
+        try {
+          const wav = await blobToWav16k(new Blob(chunks));
+          const r = await fetch('/api/stt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'audio/wav' },
+            body: wav,
+          });
+          const d = await r.json();
+          if (!r.ok) {
+            toast(d.error || 'Transcription failed.');
+          } else if (!d.text) {
+            toast("Didn't catch that.");
+          } else {
+            // Append rather than replace, so dictation can extend typed text.
+            const cur = D.inp.value.trim();
+            D.inp.value = cur ? cur + ' ' + d.text : d.text;
+            D.inp.dispatchEvent(new Event('input')); // resize + enable send
+            D.inp.focus();
+          }
+        } catch {
+          toast('Could not process the recording.');
+        } finally {
+          micBusy = false;
+          setMicState('idle');
+        }
+      }
+
+      function toggleDictation() {
+        if (micRecorder) stopDictation();
+        else startDictation();
+      }
+
       // ── Text to speech ───────────────────────────────────────
       async function loadTtsVoices() {
         if (!IS_SERVED) return;
@@ -4419,6 +4628,9 @@
       D.logModeSel.addEventListener('change', saveLogMode);
       D.sysSet.addEventListener('click', saveGlobalPrompt);
       D.sysClr.addEventListener('click', clearGlobalPrompt);
+
+      const micBtn = document.getElementById('mic-btn');
+      if (micBtn) micBtn.addEventListener('click', toggleDictation);
 
       // Text-to-speech controls (stored per device, like the theme)
       const ttsVoiceSel = document.getElementById('tts-voice-select');
