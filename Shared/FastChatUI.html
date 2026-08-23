@@ -4112,18 +4112,33 @@
         };
         marked.setOptions({ gfm: true, breaks: true, renderer: rdr });
       }
-      // Gemma 4 delimits its reasoning with paired <|channel> ... <channel|>
+      // Markers that belong to the transport rather than the reply, stripped
+      // at render time so chats saved before any given fix display correctly.
+      //
+      // Reasoning: Gemma 4 delimits it with paired <|channel> ... <channel|>
       // tokens instead of <think> ... </think>, opening with the channel name
       // ("thought") on its own line. llama.cpp only strips reasoning whose
       // format it recognises, so under any other chat template these markers
-      // reach the browser verbatim and land in the visible answer. Rewriting
-      // them to <think> hands them to the block renderer below — which also
-      // covers chats saved before this fix, since rendering happens on read.
-      function normalizeReasoningTags(text) {
+      // reach the browser verbatim. Rewriting them to <think> hands them to
+      // the block renderer below.
+      //
+      // Turn markers: a chat template substituted for the model's own writes
+      // <|im_start|>/<|im_end|> as plain text to a model that has no token for
+      // them, so the model can echo one mid-reply and carry straight on into a
+      // turn it invents for itself. The reply ends at that marker; everything
+      // after it is the model talking to itself. llama-server is told to stop
+      // there too (see _CHATML_STOP_STRINGS), so this catches what the sampler
+      // slipped through before that and anything already saved.
+      function normalizeModelOutput(text) {
         return text
+          .split(/<\|im_end\|>|<\|im_start\|>/)[0]
           .replace(/<\|channel>[ \t]*[A-Za-z_]{1,16}[ \t]*\r?\n/g, '<think>')
           .replace(/<\|channel>/g, '<think>')
-          .replace(/<channel\|>/g, '</think>');
+          .replace(/<channel\|>/g, '</think>')
+          // A model that has lost the thread repeats the marker instead of
+          // reasoning. A run of them opens nothing worth showing, so it counts
+          // as one block, which then renders as nothing because it is empty.
+          .replace(/(?:<think>\s*){2,}/g, '<think>');
       }
       function processThinkTags(text) {
         if (!text) return '';
@@ -4145,6 +4160,11 @@
         processed = processed.replace(/<think>([\s\S]*?)$/gi, (_, thinkContent) => {
           const trimmed = thinkContent.trim();
           const streaming = typeof S !== 'undefined' && S.streaming;
+          // An empty block on a finished reply is not a truncated thought: the
+          // model emitted a bare reasoning marker and nothing else. Warning
+          // about a lost answer there would be inventing a problem. Mid-stream
+          // the same emptiness just means it has started thinking.
+          if (!trimmed && !streaming) return '';
           const summary = streaming
             ? 'Thinking...'
             : 'Thought Process (incomplete)';
@@ -4158,7 +4178,7 @@
 
       function renderMd(text) {
         if (!text) return '';
-        text = normalizeReasoningTags(text);
+        text = normalizeModelOutput(text);
         
         // Extract think blocks and replace with HTML comment placeholders.
         // HTML comments pass through marked unchanged, unlike __double_underscores__

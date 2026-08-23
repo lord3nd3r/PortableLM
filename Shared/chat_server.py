@@ -557,6 +557,9 @@ def _text_for_speech(text):
     # Gemma 4 uses paired <|channel> ... <channel|> tokens for the same thing.
     s = re.sub(r"<\|channel>[\s\S]*?<channel\|>", " ", s)
     s = re.sub(r"<\|channel>[\s\S]*$", " ", s)
+    # A leaked turn marker means everything after it is a turn the model
+    # invented for itself, not part of the reply. Drop it rather than read it.
+    s = re.split(r"<\|im_end\|>|<\|im_start\|>", s)[0]
     # Fenced code: announce rather than read out every brace and semicolon.
     s = re.sub(r"```[\s\S]*?```", " (code block omitted) ", s)
     s = re.sub(r"```[\s\S]*$", " (code block omitted) ", s)
@@ -793,6 +796,18 @@ def _find_gguf_models():
 # Track the llama-server subprocess so we can kill it cleanly
 _LLAMA_PROC = None
 _LLAMA_PROC_LOCK = threading.RLock()
+
+# Stop strings for the model llama-server is currently running. Set once when
+# the process starts (see _start_llama) and read by the chat proxy.
+_LLAMA_STOP_STRINGS = ()
+
+# A chat template substituted for the model's own writes turn markers the model
+# has no token for, so the model can reproduce them as ordinary text — and then
+# nothing ends the turn. Gemma 4 under the bundled ChatML template will happily
+# emit "<|im_end|>" mid-reply, carry on into an "<|im_start|>user" turn of its
+# own invention and ramble until the context runs out. Passing the markers as
+# stop strings turns that back into a clean end of turn.
+_CHATML_STOP_STRINGS = ("<|im_end|>", "<|im_start|>")
 
 # Track the ollama serve subprocess so we can kill it cleanly
 _OLLAMA_PROC = None
@@ -1540,10 +1555,13 @@ def _start_llama(model_path, job_id=None):
             elif os.path.isfile(TOOL_CHAT_TEMPLATE):
                 use_tools = True
                 tool_template = TOOL_CHAT_TEMPLATE
+        global _LLAMA_STOP_STRINGS
+        _LLAMA_STOP_STRINGS = ()
         if use_tools:
             cmd += ["--jinja"]
             if tool_template:
                 cmd += ["--chat-template-file", tool_template]
+                _LLAMA_STOP_STRINGS = _CHATML_STOP_STRINGS
             _log_event(logging.INFO, "Tool calling enabled using %s chat template" % (
                 "the bundled ChatML" if tool_template else "the model's own"))
         else:
@@ -3414,6 +3432,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
                 }
+                if _LLAMA_STOP_STRINGS:
+                    openai_req["stop"] = list(_LLAMA_STOP_STRINGS)
                 if _tools_enabled():
                     openai_req["tools"] = TOOL_DEFINITIONS
                     openai_req["tool_choice"] = "auto"
