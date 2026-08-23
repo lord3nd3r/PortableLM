@@ -553,6 +553,9 @@ def _text_for_speech(text):
     # Reasoning traces are internal, not the reply. Drop closed and unclosed alike.
     s = re.sub(r"<think>[\s\S]*?</think>", " ", s, flags=re.IGNORECASE)
     s = re.sub(r"<think>[\s\S]*$", " ", s, flags=re.IGNORECASE)
+    # Gemma 4 uses paired <|channel> ... <channel|> tokens for the same thing.
+    s = re.sub(r"<\|channel>[\s\S]*?<channel\|>", " ", s)
+    s = re.sub(r"<\|channel>[\s\S]*$", " ", s)
     # Fenced code: announce rather than read out every brace and semicolon.
     s = re.sub(r"```[\s\S]*?```", " (code block omitted) ", s)
     s = re.sub(r"```[\s\S]*$", " (code block omitted) ", s)
