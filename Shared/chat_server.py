@@ -269,6 +269,129 @@ def _set_active_engine(engine):
 # Always resolve paths relative to THIS script's location (the USB drive)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# ── Text-to-Speech (piper) ─────────────────────────────────────
+def _find_piper_binary():
+    """Locate the piper text-to-speech binary for this platform."""
+    plat = platform.system()
+    bin_dir = os.path.join(SCRIPT_DIR, "bin")
+    if plat == "Windows":
+        candidates = [os.path.join(bin_dir, "piper-windows", "piper.exe")]
+    elif plat == "Linux":
+        candidates = [os.path.join(bin_dir, "piper-linux", "piper")]
+    else:  # Darwin / macOS
+        candidates = [os.path.join(bin_dir, "piper-mac", "piper")]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+PIPER_BINARY = _find_piper_binary()
+PIPER_VOICES_DIR = os.path.join(SCRIPT_DIR, "models", "voices")
+# Piper is roughly 10x realtime on CPU, so synthesis is done inline rather than
+# through the background-job pattern used for image generation.
+TTS_MAX_CHARS = 4000
+
+def _find_piper_voices():
+    """Return every installed piper voice (.onnx paired with its .onnx.json)."""
+    found = []
+    if os.path.isdir(PIPER_VOICES_DIR):
+        for fname in sorted(os.listdir(PIPER_VOICES_DIR)):
+            if not fname.lower().endswith(".onnx"):
+                continue
+            path = os.path.join(PIPER_VOICES_DIR, fname)
+            # A voice without its config cannot be loaded, so don't offer it.
+            if not os.path.isfile(path + ".json"):
+                continue
+            stem = os.path.splitext(fname)[0]
+            found.append({
+                "file": fname,
+                "path": path,
+                "name": stem.replace("_", " ").replace("-", " "),
+                "id": stem,
+            })
+    return found
+
+def _text_for_speech(text):
+    """Strip markup from model output so it reads naturally aloud.
+
+    Spoken output has different needs than rendered output: literal asterisks,
+    backtick fences and raw URLs are unbearable read out, and reasoning traces
+    are not part of the answer at all. Anything unspeakable is either dropped
+    or replaced with a short spoken stand-in.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    # Reasoning traces are internal, not the reply. Drop closed and unclosed alike.
+    s = re.sub(r"<think>[\s\S]*?</think>", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<think>[\s\S]*$", " ", s, flags=re.IGNORECASE)
+    # Fenced code: announce rather than read out every brace and semicolon.
+    s = re.sub(r"```[\s\S]*?```", " (code block omitted) ", s)
+    s = re.sub(r"```[\s\S]*$", " (code block omitted) ", s)
+    # Images before links, so alt text doesn't survive as a stray phrase.
+    s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", " ", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)   # keep link text, drop target
+    s = re.sub(r"<[^>]+>", " ", s)                    # any remaining HTML
+    s = re.sub(r"https?://\S+", " (link) ", s)        # bare URLs
+    s = re.sub(r"`([^`]*)`", r"\1", s)                # inline code: keep content
+    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.MULTILINE)  # heading marks
+    s = re.sub(r"^\s{0,3}>\s?", "", s, flags=re.MULTILINE)       # block quotes
+    s = re.sub(r"^\s{0,3}[-*_]{3,}\s*$", " ", s, flags=re.MULTILINE)  # rules
+    s = re.sub(r"^(\s*)[-*+]\s+", r"\1", s, flags=re.MULTILINE)  # bullets
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)          # bold
+    s = re.sub(r"(?<!\w)[*_]([^*_\n]+)[*_](?!\w)", r"\1", s)  # italics
+    s = re.sub(r"^\s*\|?[\s:|-]*\|[\s:|-]*\|?\s*$", " ", s, flags=re.MULTILINE)  # table separator row
+    s = s.replace("|", " ")                            # remaining table pipes
+    s = re.sub(r"(?<!\w)-{3,}(?!\w)", " ", s)          # leftover dash runs
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n", s)
+    return s.strip()
+
+def _synthesize_speech(text, voice_path, length_scale=1.0):
+    """Run piper and return WAV bytes. Raises on failure."""
+    if not PIPER_BINARY or not os.path.isfile(PIPER_BINARY):
+        raise RuntimeError("Text-to-speech engine not installed. Please run the installer.")
+    if not voice_path or not os.path.isfile(voice_path):
+        raise RuntimeError("No voice model found. Please run the installer.")
+
+    bin_dir = os.path.dirname(os.path.abspath(PIPER_BINARY))
+    env = os.environ.copy()
+    if platform.system() != "Windows":
+        # piper ships its own onnxruntime/espeak libs next to the binary
+        key = "DYLD_LIBRARY_PATH" if platform.system() == "Darwin" else "LD_LIBRARY_PATH"
+        existing = env.get(key, "")
+        env[key] = bin_dir + ((os.pathsep + existing) if existing else "")
+
+    # piper writes the WAV to a file; '-' (stdout) mixes with its logging on
+    # some builds, so use a temp file and read it back.
+    tmp_dir = os.path.join(SCRIPT_DIR, "chat_data", "tts_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    out_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.wav")
+    cmd = [
+        PIPER_BINARY,
+        "--model", voice_path,
+        "--output_file", out_path,
+        "--length_scale", str(length_scale),
+        "--quiet",
+    ]
+    try:
+        # Text goes over stdin, never the command line: no shell, no injection,
+        # and no length limit from the OS argument cap.
+        proc = subprocess.run(
+            cmd, input=text.encode("utf-8"), env=env,
+            capture_output=True, timeout=120,
+        )
+        if proc.returncode != 0 or not os.path.isfile(out_path):
+            detail = proc.stderr.decode("utf-8", errors="ignore").strip()[:200]
+            raise RuntimeError(f"Speech synthesis failed. {detail}")
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+
 # ── Stable Diffusion Engine Paths ──────────────────────────────
 def _find_sd_binary():
     """Locate the stable-diffusion.cpp CLI binary for this platform."""
@@ -1704,6 +1827,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/image-models":
             self._get_image_models()
 
+        # Text-to-speech voice list
+        elif path == "/api/tts-voices":
+            self._get_tts_voices()
+
         # Image generation progress API
         elif path == "/api/image-progress":
             self._get_image_progress()
@@ -1740,6 +1867,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         # Image generation API
         elif path == "/api/generate-image":
             self._generate_image()
+
+        # Text-to-speech synthesis
+        elif path == "/api/tts":
+            self._tts_endpoint()
 
         # Engine control APIs
         elif path == "/api/stop-ollama":
@@ -1958,6 +2089,85 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data.encode())
 
+    # ── Text-to-Speech API ─────────────────────────────────────
+    def _get_tts_voices(self):
+        """Return installed piper voices and whether TTS is usable at all."""
+        voices = _find_piper_voices()
+        data = json.dumps({
+            "tts_enabled": bool(PIPER_BINARY) and len(voices) > 0,
+            "has_binary": bool(PIPER_BINARY),
+            "voices": [{"id": v["id"], "name": v["name"], "file": v["file"]} for v in voices],
+        })
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(data.encode())
+
+    def _tts_endpoint(self):
+        """Synthesize speech from text and return WAV audio.
+
+        Synchronous on purpose: piper runs at roughly 10x realtime, so even a
+        long reply is a couple of seconds and the background-job pattern used
+        for image generation would only add latency and polling.
+        """
+        request_context = self._build_request_context("/api/tts")
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+
+        def fail(code, message):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": message}).encode())
+
+        raw_text = payload.get("text", "")
+        speech_text = _text_for_speech(raw_text)
+        if not speech_text:
+            # Nothing speakable (e.g. the reply was only a code block).
+            fail(400, "Nothing to speak.")
+            return
+        if len(speech_text) > TTS_MAX_CHARS:
+            speech_text = speech_text[:TTS_MAX_CHARS]
+
+        voices = _find_piper_voices()
+        if not voices:
+            fail(503, "No voice installed. Please run the installer to add one.")
+            return
+
+        # Pick the requested voice, else fall back to the first installed one.
+        requested = os.path.basename(str(payload.get("voice", "") or ""))
+        voice = next((v for v in voices if v["id"] == requested or v["file"] == requested), voices[0])
+
+        try:
+            rate = float(payload.get("length_scale", 1.0))
+        except (TypeError, ValueError):
+            rate = 1.0
+        rate = max(0.5, min(2.0, rate))  # clamp to a sane speaking speed
+
+        try:
+            wav = _synthesize_speech(speech_text, voice["path"], length_scale=rate)
+        except Exception as e:
+            _log_event(logging.ERROR, "Speech synthesis failed",
+                       request_context=request_context, exc_info=True)
+            fail(500, str(e))
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.end_headers()
+        try:
+            self.wfile.write(wav)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # client navigated away mid-playback
+
     def _get_engine_status(self):
         """Return which engines are currently running."""
         ollama_up = _is_ollama_running()
@@ -1978,6 +2188,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             "sd_model": len(current_models) > 0,
             "sd_healthy": _test_sd_binary(),
             "sd_backend": SD_BACKEND or "cpu",
+            "tts_enabled": bool(PIPER_BINARY) and len(_find_piper_voices()) > 0,
         })
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

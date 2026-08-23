@@ -1235,6 +1235,15 @@
       .mab.dlk {
         color: var(--red);
       }
+      /* Currently being read aloud — kept visible even when the row isn't
+         hovered, so there is always a reachable stop control. */
+      .mab.spk-on {
+        color: var(--grad1);
+        opacity: 1;
+      }
+      .mr:has(.spk-on) .mact {
+        opacity: 1;
+      }
 
       /* Typing dots */
       .typ {
@@ -2307,6 +2316,26 @@
           </button>
         </div>
         <hr class="sys-divider" />
+        <!-- Hidden until the server reports a piper binary + at least one voice -->
+        <div id="tts-settings" style="display:none">
+          <div class="sys-row">
+            <label for="tts-voice-select">Voice (read aloud)</label>
+            <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+              <select id="tts-voice-select" class="sys-select"></select>
+              <label class="sys-hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="tts-auto" /> Speak replies automatically
+              </label>
+            </div>
+          </div>
+          <div class="sys-row">
+            <label for="tts-rate">Speech pace</label>
+            <div class="sys-subrow" style="align-items:center;gap:8px;">
+              <input type="range" id="tts-rate" min="0.6" max="1.6" step="0.05" style="flex:1;max-width:220px;" />
+              <span class="sys-hint" id="tts-rate-val">1.00x length</span>
+            </div>
+          </div>
+          <hr class="sys-divider" />
+        </div>
         <div class="sys-row">
           <label for="log-mode-select">Logging</label>
           <div class="sys-subrow">
@@ -2715,6 +2744,13 @@
       logMode: localStorage.getItem('logMode') || 'errors_only',
       mode: 'chat', // 'chat' or 'image'
 
+      // Text to speech. ttsEnabled is discovered from the server (binary +
+      // at least one voice installed); the rest are user preferences.
+      ttsEnabled: false,
+      ttsVoice: localStorage.getItem('ttsVoice') || '',
+      ttsRate: parseFloat(localStorage.getItem('ttsRate')) || 1.0,
+      ttsAuto: localStorage.getItem('ttsAuto') === '1',
+
         // Attachments (multi-file)
         attachments: [],
       };
@@ -2803,6 +2839,7 @@
         if (!S.sbOpen) D.sb.classList.add('off');
 
         await loadGlobalPrompt();
+        await loadTtsVoices();
         await fetchModels();
         await load();
 
@@ -3620,6 +3657,8 @@
       }
 
       function switchConv(id) {
+        // Leaving a conversation should stop it being read aloud.
+        stopSpeaking();
         S.curId = id;
         const conv = getConv();
         if (conv && conv.model) applyModel(conv.model);
@@ -3637,6 +3676,8 @@
       // ÔöÇÔöÇ Send / Stream to Ollama ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
       async function sendMsg(text) {
         if ((!text.trim() && !S.attachments.length) || S.streaming) return;
+        // Asking something new should cut off the previous answer being read.
+        stopSpeaking();
 
         let conv = getConv();
         if (!conv) {
@@ -3823,6 +3864,14 @@
           save();
           scrollEnd();
           setTimeout(() => D.inp.focus(), 100);
+          // Re-render so the speak button appears now that streaming is over
+          // (message actions are suppressed on the in-flight message).
+          renderChat();
+          // Auto-speak only a completed reply that actually has content — not
+          // a stopped or errored one, which would announce a stale answer.
+          if (S.ttsAuto && S.ttsEnabled && aiMsg.content && conv.msgs.includes(aiMsg)) {
+            speakText(aiMsg.content, aiMsg.id);
+          }
         }
       }
 
@@ -4008,6 +4057,7 @@
             ? `
         <div class="mact">
             <button class="mab" onclick="copyMsg('${msg.id}')" title="Copy"><i class="fa-regular fa-copy"></i></button>
+            ${S.ttsEnabled ? `<button class="mab spk-btn" data-spk="${msg.id}" onclick="speakMsg('${msg.id}')" title="Read aloud"><i class="fa-solid fa-volume-high"></i></button>` : ''}
             <button class="mab ${msg.liked ? 'lk' : ''}" onclick="rateMsg('${msg.id}','like')" title="Good response"><i class="fa-regular fa-thumbs-up"></i></button>
             <button class="mab ${msg.disliked ? 'dlk' : ''}" onclick="rateMsg('${msg.id}','dislike')" title="Bad response"><i class="fa-regular fa-thumbs-down"></i></button>
         </div>`
@@ -4024,6 +4074,135 @@
         const m = getConv()?.msgs.find((x) => x.id === id);
         if (m)
           navigator.clipboard.writeText(m.content).then(() => toast('Copied'));
+      }
+
+      // ── Text to speech ───────────────────────────────────────
+      async function loadTtsVoices() {
+        if (!IS_SERVED) return;
+        try {
+          const r = await fetch('/api/tts-voices');
+          const d = await r.json();
+          S.ttsEnabled = !!d.tts_enabled;
+          S.ttsVoices = d.voices || [];
+          // Drop a saved voice that is no longer installed, so we fall back to
+          // the server's default instead of erroring on every request.
+          if (S.ttsVoice && !S.ttsVoices.some((v) => v.id === S.ttsVoice)) {
+            S.ttsVoice = '';
+            localStorage.removeItem('ttsVoice');
+          }
+          renderTtsSettings();
+        } catch {
+          S.ttsEnabled = false;
+        }
+      }
+
+      function renderTtsSettings() {
+        const wrap = document.getElementById('tts-settings');
+        if (!wrap) return;
+        if (!S.ttsEnabled) {
+          wrap.style.display = 'none';
+          return;
+        }
+        wrap.style.display = 'block';
+        const sel = document.getElementById('tts-voice-select');
+        if (sel && !sel.dataset.filled) {
+          sel.innerHTML = S.ttsVoices
+            .map(
+              (v) =>
+                `<option value="${esc(v.id)}"${v.id === S.ttsVoice ? ' selected' : ''}>${esc(v.name)}</option>`,
+            )
+            .join('');
+          sel.dataset.filled = '1';
+        }
+        const auto = document.getElementById('tts-auto');
+        if (auto) auto.checked = S.ttsAuto;
+        const rate = document.getElementById('tts-rate');
+        const rateVal = document.getElementById('tts-rate-val');
+        if (rate) rate.value = S.ttsRate;
+        // length_scale is inverse: higher stretches phonemes, i.e. slower.
+        if (rateVal) rateVal.textContent = `${S.ttsRate.toFixed(2)}x length`;
+      }
+
+      // One shared player: starting new speech always replaces whatever was
+      // playing, so clicking several messages can't stack overlapping audio.
+      let ttsAudio = null;
+      let ttsSpeakingId = null;
+      let ttsAbort = null;
+
+      function stopSpeaking() {
+        if (ttsAbort) {
+          ttsAbort.abort();
+          ttsAbort = null;
+        }
+        if (ttsAudio) {
+          ttsAudio.pause();
+          if (ttsAudio.src) URL.revokeObjectURL(ttsAudio.src);
+          ttsAudio = null;
+        }
+        ttsSpeakingId = null;
+        markSpeaking(null);
+      }
+
+      function markSpeaking(id) {
+        $$('.spk-btn').forEach((b) => {
+          const on = b.dataset.spk === id;
+          b.classList.toggle('spk-on', on);
+          b.innerHTML = on
+            ? '<i class="fa-solid fa-stop"></i>'
+            : '<i class="fa-solid fa-volume-high"></i>';
+        });
+      }
+
+      async function speakText(text, id) {
+        if (!text || !text.trim()) return;
+        stopSpeaking(); // clicking a second message replaces the first
+        ttsSpeakingId = id || null;
+        markSpeaking(ttsSpeakingId);
+        ttsAbort = new AbortController();
+        try {
+          const r = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text,
+              voice: S.ttsVoice || '',
+              length_scale: S.ttsRate || 1.0,
+            }),
+            signal: ttsAbort.signal,
+          });
+          if (!r.ok) {
+            let msg = 'Speech failed.';
+            try {
+              msg = (await r.json()).error || msg;
+            } catch {}
+            stopSpeaking();
+            toast(msg);
+            return;
+          }
+          const blob = await r.blob();
+          // A newer request may have superseded this one while we waited.
+          if (ttsSpeakingId !== (id || null)) return;
+          const a = new Audio(URL.createObjectURL(blob));
+          ttsAudio = a;
+          a.onended = () => stopSpeaking();
+          a.onerror = () => stopSpeaking();
+          await a.play();
+        } catch (e) {
+          if (e.name !== 'AbortError') {
+            stopSpeaking();
+            toast('Speech failed.');
+          }
+        }
+      }
+
+      function speakMsg(id) {
+        // Clicking the button of the message already playing acts as stop.
+        if (ttsSpeakingId === id) {
+          stopSpeaking();
+          return;
+        }
+        const m = getConv()?.msgs.find((x) => x.id === id);
+        if (m) speakText(m.content, id);
       }
       function rateMsg(id, r) {
         const m = getConv()?.msgs.find((x) => x.id === id);
@@ -4240,6 +4419,32 @@
       D.logModeSel.addEventListener('change', saveLogMode);
       D.sysSet.addEventListener('click', saveGlobalPrompt);
       D.sysClr.addEventListener('click', clearGlobalPrompt);
+
+      // Text-to-speech controls (stored per device, like the theme)
+      const ttsVoiceSel = document.getElementById('tts-voice-select');
+      if (ttsVoiceSel) {
+        ttsVoiceSel.addEventListener('change', () => {
+          S.ttsVoice = ttsVoiceSel.value;
+          localStorage.setItem('ttsVoice', S.ttsVoice);
+        });
+      }
+      const ttsAutoBox = document.getElementById('tts-auto');
+      if (ttsAutoBox) {
+        ttsAutoBox.addEventListener('change', () => {
+          S.ttsAuto = ttsAutoBox.checked;
+          localStorage.setItem('ttsAuto', S.ttsAuto ? '1' : '0');
+          if (!S.ttsAuto) stopSpeaking();
+        });
+      }
+      const ttsRateInput = document.getElementById('tts-rate');
+      if (ttsRateInput) {
+        ttsRateInput.addEventListener('input', () => {
+          S.ttsRate = parseFloat(ttsRateInput.value) || 1.0;
+          localStorage.setItem('ttsRate', String(S.ttsRate));
+          const rv = document.getElementById('tts-rate-val');
+          if (rv) rv.textContent = `${S.ttsRate.toFixed(2)}x length`;
+        });
+      }
 
       // Chat backend switcher
       const chatEngineSel = document.getElementById('chat-engine-select');

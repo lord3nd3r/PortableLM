@@ -681,6 +681,75 @@ else
 fi
 
 # ================================================================
+# STEP 6e: Download piper text-to-speech engine + voice
+# ================================================================
+echo ""
+echo -e "${YLW}[6e/7] Downloading text-to-speech engine (optional, ~85 MB)...${RST}"
+
+PIPER_DIR="$SHARED_BIN/piper-mac"
+PIPER_BIN="$PIPER_DIR/piper"
+PIPER_REL="2023.11.14-2"
+VOICES_DIR="$MODELS_DIR/voices"
+# Default voice: en_GB alan (medium). Piper needs the .onnx and its .onnx.json
+# side by side; the server ignores a voice that is missing either half.
+VOICE_ID="en_GB-alan-medium"
+VOICE_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium"
+
+case "$(uname -m)" in
+    arm64)  PIPER_ARCH="macos_aarch64" ;;
+    x86_64) PIPER_ARCH="macos_x64" ;;
+    *)      PIPER_ARCH="" ;;
+esac
+
+if [ -z "$PIPER_ARCH" ]; then
+    echo -e "${YLW}      No piper build for $(uname -m) - skipping text-to-speech.${RST}"
+else
+    if [ -f "$PIPER_BIN" ] && file_ok "$PIPER_BIN" 100000; then
+        echo -e "${GRN}      piper already installed! Skipping...${RST}"
+    else
+        mkdir -p "$PIPER_DIR"
+        PIPER_TMP="$SHARED_BIN/piper.tar.gz"
+        echo -e "      Downloading piper (${PIPER_ARCH})..."
+        curl -L --fail "https://github.com/rhasspy/piper/releases/download/${PIPER_REL}/piper_${PIPER_ARCH}.tar.gz" -o "$PIPER_TMP"
+        if [ -f "$PIPER_TMP" ]; then
+            # The archive contains a top-level piper/ directory holding the
+            # binary plus its bundled onnxruntime and espeak-ng libraries.
+            tar -xzf "$PIPER_TMP" -C "$PIPER_DIR" --strip-components=1 2>/dev/null || \
+                tar -xzf "$PIPER_TMP" -C "$PIPER_DIR" 2>/dev/null || true
+            rm -f "$PIPER_TMP"
+            if [ -f "$PIPER_BIN" ]; then
+                chmod +x "$PIPER_BIN"
+                xattr -dr com.apple.quarantine "$PIPER_DIR" 2>/dev/null || true
+                echo -e "${GRN}      piper installed!${RST}"
+            else
+                echo -e "${YLW}      WARNING: piper binary not found after extraction. Read-aloud will be unavailable.${RST}"
+            fi
+        else
+            echo -e "${YLW}      WARNING: piper download failed. Read-aloud will be unavailable.${RST}"
+        fi
+    fi
+
+    # Voice model (only worth fetching if the binary is actually present)
+    if [ -f "$PIPER_BIN" ]; then
+        mkdir -p "$VOICES_DIR"
+        if file_ok "$VOICES_DIR/${VOICE_ID}.onnx" 50000000; then
+            echo -e "${GRN}      Voice '${VOICE_ID}' already downloaded! Skipping...${RST}"
+        else
+            echo -e "      Downloading voice ${VOICE_ID} (~63 MB)..."
+            curl -L --fail "$VOICE_BASE/${VOICE_ID}.onnx" -o "$VOICES_DIR/${VOICE_ID}.onnx"
+            curl -L --fail "$VOICE_BASE/${VOICE_ID}.onnx.json" -o "$VOICES_DIR/${VOICE_ID}.onnx.json"
+            if file_ok "$VOICES_DIR/${VOICE_ID}.onnx" 50000000 && [ -f "$VOICES_DIR/${VOICE_ID}.onnx.json" ]; then
+                echo -e "${GRN}      Voice installed!${RST}"
+            else
+                # Remove a half-downloaded pair so the server doesn't offer a broken voice
+                rm -f "$VOICES_DIR/${VOICE_ID}.onnx" "$VOICES_DIR/${VOICE_ID}.onnx.json"
+                echo -e "${YLW}      WARNING: voice download failed. Read-aloud will be unavailable.${RST}"
+            fi
+        fi
+    fi
+fi
+
+# ================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # ================================================================
 echo ""

@@ -782,6 +782,70 @@ if ((Test-Path $llamaBin) -and ((Get-Item $llamaBin).Length -gt 1MB)) {
 }
 
 # =================================================================
+# STEP 6e: Download piper text-to-speech engine + voice
+# =================================================================
+Write-Host ""
+Write-Host "[6e/7] Downloading text-to-speech engine (optional, ~85 MB)..." -ForegroundColor Yellow
+
+$PiperDir     = "$USB_Drive\Shared\bin\piper-windows"
+$PiperExe     = "$PiperDir\piper.exe"
+$PiperURL     = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip"
+$PiperZip     = "$USB_Drive\Shared\bin\piper-windows.zip"
+$VoicesDir    = "$USB_Drive\Shared\models\voices"
+# Default voice: en_GB alan (medium). Piper needs the .onnx and its .onnx.json
+# side by side; the server ignores a voice that is missing either half.
+$VoiceId      = "en_GB-alan-medium"
+$VoiceBase    = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium"
+
+if (Test-Path $PiperExe) {
+    Write-Host "      piper already installed! Skipping..." -ForegroundColor Green
+} else {
+    New-Item -ItemType Directory -Force -Path $PiperDir | Out-Null
+    curl.exe -L --ssl-no-revoke --progress-bar $PiperURL -o $PiperZip
+    if (Test-Path $PiperZip) {
+        # The archive contains a top-level piper\ directory holding the exe
+        # plus its bundled onnxruntime and espeak-ng DLLs.
+        $tempPiper = "$USB_Drive\Shared\bin\piper-tmp"
+        if (Test-Path $tempPiper) { Remove-Item -Recurse -Force $tempPiper }
+        Expand-Archive -Path $PiperZip -DestinationPath $tempPiper -Force
+        $inner = Get-ChildItem -Path $tempPiper -Directory | Select-Object -First 1
+        $srcDir = if ($inner) { $inner.FullName } else { $tempPiper }
+        Copy-Item -Path "$srcDir\*" -Destination $PiperDir -Recurse -Force
+        Remove-Item -Recurse -Force $tempPiper -ErrorAction SilentlyContinue
+        Remove-Item $PiperZip -Force -ErrorAction SilentlyContinue
+        if (Test-Path $PiperExe) {
+            Write-Host "      piper installed!" -ForegroundColor Green
+        } else {
+            Write-Host "      WARNING: piper.exe not found after extraction. Read-aloud will be unavailable." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "      WARNING: piper download failed. Read-aloud will be unavailable." -ForegroundColor Yellow
+    }
+}
+
+# Voice model (only worth fetching if the binary is actually present)
+if (Test-Path $PiperExe) {
+    New-Item -ItemType Directory -Force -Path $VoicesDir | Out-Null
+    $voiceOnnx = "$VoicesDir\$VoiceId.onnx"
+    $voiceJson = "$VoicesDir\$VoiceId.onnx.json"
+    if (Test-DownloadedFile -Path $voiceOnnx -MinSize 50000000) {
+        Write-Host "      Voice '$VoiceId' already downloaded! Skipping..." -ForegroundColor Green
+    } else {
+        Write-Host "      Downloading voice $VoiceId (~63 MB)..." -ForegroundColor Magenta
+        curl.exe -L --ssl-no-revoke --progress-bar "$VoiceBase/$VoiceId.onnx" -o $voiceOnnx
+        curl.exe -L --ssl-no-revoke --progress-bar "$VoiceBase/$VoiceId.onnx.json" -o $voiceJson
+        if ((Test-DownloadedFile -Path $voiceOnnx -MinSize 50000000) -and (Test-Path $voiceJson)) {
+            Write-Host "      Voice installed!" -ForegroundColor Green
+        } else {
+            # Remove a half-downloaded pair so the server doesn't offer a broken voice
+            Remove-Item $voiceOnnx -Force -ErrorAction SilentlyContinue
+            Remove-Item $voiceJson -Force -ErrorAction SilentlyContinue
+            Write-Host "      WARNING: voice download failed. Read-aloud will be unavailable." -ForegroundColor Yellow
+        }
+    }
+}
+
+# =================================================================
 # STEP 6c: Download CyberRealistic Image Model
 # =================================================================
 Write-Host ""
