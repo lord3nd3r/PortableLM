@@ -503,6 +503,42 @@ def _transcribe_audio(wav_bytes, model_path):
         except Exception:
             pass
 
+# Emoji and decorative symbol ranges. espeak-ng pronounces these by their
+# Unicode names ("smiling face with smiling eyes"), which roughly doubles the
+# length of a short reply and sounds absurd. Deliberately surgical: degree
+# signs, dashes, curly quotes, ellipses and (c)/(r)/(tm) are all left alone
+# because they either matter ("20°C") or already read correctly.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"  # emoji blocks: pictographs, faces, transport, flags
+    "←-⇿"          # arrows
+    "☀-⛿"          # miscellaneous symbols
+    "✀-➿"          # dingbats: check marks, crosses, stars
+    "⬀-⯿"          # misc symbols and arrows
+    "︀-️"          # variation selectors
+    "‍"                 # zero-width joiner (emoji sequences)
+    "⃣"                 # combining enclosing keycap
+    "•"                 # bullet
+    "]"
+)
+
+# Text emoticons. Anchored to whitespace on the left and whitespace or
+# sentence punctuation on the right so timestamps ("9:30"), ratios ("3:4")
+# and code are never mangled.
+# Note "8" is deliberately absent from the leading character class: "8)" is a
+# sunglasses emoticon but far more often a numbered list item, and silently
+# eating list numbers is worse than leaving one rare emoticon in.
+_EMOTICON_RE = re.compile(
+    r"(?<![^\s])"                       # start of string or preceded by space
+    r"(?:[:;=][-~^]?[)(\]\[DdPpOo3><|/\\]{1,2}|<3|\^_\^|>:\(|:'\()"
+    r"(?=[\s.,!?;:]|$)"                 # followed by space, punctuation, or end
+)
+
+def _strip_unspeakable_symbols(text):
+    """Remove emoji and text emoticons before synthesis."""
+    text = _EMOJI_RE.sub(" ", text)
+    return _EMOTICON_RE.sub(" ", text)
+
 def _text_for_speech(text):
     """Strip markup from model output so it reads naturally aloud.
 
@@ -532,6 +568,7 @@ def _text_for_speech(text):
     s = re.sub(r"^(\s*)[-*+]\s+", r"\1", s, flags=re.MULTILINE)  # bullets
     s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)          # bold
     s = re.sub(r"(?<!\w)[*_]([^*_\n]+)[*_](?!\w)", r"\1", s)  # italics
+    s = _strip_unspeakable_symbols(s)
     s = re.sub(r"^\s*\|?[\s:|-]*\|[\s:|-]*\|?\s*$", " ", s, flags=re.MULTILINE)  # table separator row
     s = s.replace("|", " ")                            # remaining table pipes
     s = re.sub(r"(?<!\w)-{3,}(?!\w)", " ", s)          # leftover dash runs
