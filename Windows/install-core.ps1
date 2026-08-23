@@ -32,6 +32,13 @@ try {
             Label    = [string]$m.label
             Badge    = [string]$m.badge
             Prompt   = [string]$m.prompt
+            # Optional: vision models ship a separate multimodal projector,
+            # and are pinned to the llama.cpp engine (Ollama cannot attach an
+            # mmproj to a bare imported GGUF). Empty for ordinary text models.
+            MmprojFile     = [string]$m.mmproj_file
+            MmprojURL      = [string]$m.mmproj_url
+            MmprojMinBytes = $(if ($m.mmproj_min_bytes) { [long]$m.mmproj_min_bytes } else { [long]1000000 })
+            Engine         = [string]$m.engine
         }
     }
 } catch {
@@ -512,6 +519,49 @@ foreach ($m in $SelectedModels) {
     }
 }
 
+# Vision models ship a second file: the multimodal projector (mmproj). Without
+# it llama-server loads fine but refuses every image, so a missing projector is
+# a real failure, not a silent downgrade. Done as its own pass because the loop
+# above uses 'continue' when a model is already present, which would otherwise
+# skip the projector on a re-run.
+foreach ($m in $SelectedModels) {
+    if ([string]::IsNullOrWhiteSpace($m.MmprojFile) -or [string]::IsNullOrWhiteSpace($m.MmprojURL)) {
+        continue
+    }
+
+    $mmDest = "$USB_Drive\Shared\models\$($m.MmprojFile)"
+    Write-Host ""
+    Write-Host "      + vision projector ($($m.MmprojFile))" -ForegroundColor Yellow
+
+    if (Test-DownloadedFile -Path $mmDest -MinSize $m.MmprojMinBytes) {
+        Write-Host "      Projector already downloaded! Skipping..." -ForegroundColor Green
+        continue
+    }
+    if (Copy-ModelFromDriveRoot -FileName $m.MmprojFile -DestPath $mmDest -MinSize $m.MmprojMinBytes) {
+        continue
+    }
+
+    $mmOk = $false
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Host "      Retry attempt $attempt..." -ForegroundColor Yellow
+        }
+        curl.exe -L --ssl-no-revoke --progress-bar $m.MmprojURL -o $mmDest
+        if (Test-DownloadedFile -Path $mmDest -MinSize $m.MmprojMinBytes) {
+            $mmOk = $true
+            break
+        }
+    }
+
+    if ($mmOk) {
+        Write-Host "      Projector download complete!" -ForegroundColor Green
+    } else {
+        $downloadErrors += "$($m.Name) (vision projector)"
+        Write-Host "      ERROR: Projector download failed - image input will not work!" -ForegroundColor Red
+        Write-Host "      $($m.MmprojURL)" -ForegroundColor DarkGray
+    }
+}
+
 $HaveChatModel = ($SelectedModels.Count -gt 0)
 
 # =================================================================
@@ -536,8 +586,11 @@ SYSTEM $($m.Prompt)
     Write-Host "      Config: $($m.Name) -> $($m.Local)" -ForegroundColor Green
 }
 
-# Also create a legacy "Modelfile" pointing to the first selected model (backward compat)
-$firstModel = $SelectedModels[0]
+# Also create a legacy "Modelfile" pointing to the first selected model (backward compat).
+# That default feeds Ollama, so prefer a model Ollama can actually run and fall
+# back to the first selection only if nothing else was chosen.
+$firstModel = $SelectedModels | Where-Object { $_.Engine -ne "llama" } | Select-Object -First 1
+if (-not $firstModel) { $firstModel = $SelectedModels[0] }
 $legacyModelfile = @"
 FROM ./$($firstModel.File)
 PARAMETER temperature 0.7
@@ -775,6 +828,14 @@ if (-not $HaveChatModel) {
 
     $modelsToImport = @()
     foreach ($m in $SelectedModels) {
+        # Models pinned to llama.cpp (vision GGUFs) are deliberately not
+        # imported into Ollama: 'ollama create' from a bare GGUF cannot attach
+        # the mmproj projector, so the import would appear to succeed and then
+        # silently ignore every attached image.
+        if ($m.Engine -eq "llama") {
+            Write-Host "      Skipping $($m.Name) for Ollama (llama.cpp engine only)" -ForegroundColor DarkGray
+            continue
+        }
         $ggufPath = "$USB_Drive\Shared\models\$($m.File)"
         if (Test-Path $ggufPath) {
             $modelsToImport += $m

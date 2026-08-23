@@ -2682,6 +2682,11 @@
       const IS_SERVED =
         location.protocol === 'http:' || location.protocol === 'https:';
       const OLLAMA = IS_SERVED ? '/ollama' : 'http://127.0.0.1:11434';
+      // Filename/name markers identifying a multimodal model. Kept in sync
+      // with VISION_MODEL_MARKERS in chat_server.py. Note '-vl-'/'-vl.' rather
+      // than 'qwen-vl': real filenames read "Qwen2.5-VL-3B-Instruct", which a
+      // literal 'qwen-vl' match would miss, wrongly warning that a genuine
+      // vision model cannot see images.
       const VISION_MODELS = [
         'llava',
         'moondream',
@@ -2689,7 +2694,11 @@
         'vision',
         'minicpm-v',
         'cogvlm',
-        'qwen-vl',
+        '-vl-',
+        'smolvlm',
+        'pixtral',
+        'internvl',
+        'gemma-3',
         'phi-3-vision',
       ];
 
@@ -2927,9 +2936,19 @@
 
       // ÔöÇÔöÇ Models ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
       function isVision(name) {
-        return VISION_MODELS.some((v) =>
-          (name || '').toLowerCase().includes(v),
-        );
+        // Normalize separators before matching. Model names reach the UI in
+        // two shapes: raw filenames ("Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf") and
+        // the server's display form, which replaces - and _ with spaces
+        // ("Qwen2.5 VL 3B Instruct Q4 K M"). Collapsing both to hyphens lets a
+        // single set of markers match either. The leading/trailing hyphens let
+        // a marker like '-vl-' match at the start or end of the name too.
+        const n =
+          '-' +
+          String(name || '')
+            .toLowerCase()
+            .replace(/[\s_.]+/g, '-') +
+          '-';
+        return VISION_MODELS.some((v) => n.includes(v));
       }
 
       async function fetchModels() {

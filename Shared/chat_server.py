@@ -416,12 +416,17 @@ def _find_llama_bin():
 LLAMA_BIN = _find_llama_bin()
 
 def _find_gguf_models():
-    """Return list of dicts for every .gguf file in the models folder."""
+    """Return list of dicts for every selectable .gguf chat model.
+
+    Skips mmproj projector files: they sit alongside vision models in the same
+    folder but are not chat models on their own, and llama-server refuses them
+    with "CLIP cannot be used as main model, use it with --mmproj instead".
+    """
     models_dir = os.path.join(SCRIPT_DIR, "models")
     found = []
     if os.path.isdir(models_dir):
         for fname in sorted(os.listdir(models_dir)):
-            if fname.lower().endswith(".gguf"):
+            if fname.lower().endswith(".gguf") and "mmproj" not in fname.lower():
                 found.append({
                     "file": fname,
                     "path": os.path.join(models_dir, fname),
@@ -793,6 +798,108 @@ def _estimate_tokens(text):
         return 0
     return max(1, len(text) // 4)
 
+def _b64_image_mime(b64):
+    """Infer an image mime type from the leading bytes of its base64 text.
+
+    The UI strips the data: prefix and sends bare base64, so the original mime
+    is lost. Decoders sniff the real format from magic bytes anyway, but the
+    data URL still needs a plausible type.
+    """
+    prefix = str(b64 or "")[:16]
+    if prefix.startswith("iVBORw0KGgo"):
+        return "image/png"
+    if prefix.startswith("R0lGOD"):
+        return "image/gif"
+    if prefix.startswith("UklGR"):
+        return "image/webp"
+    return "image/jpeg"
+
+def _ollama_msg_to_openai(msg):
+    """Convert one Ollama-format message to OpenAI chat format.
+
+    Ollama attaches images as a list of bare base64 strings under "images";
+    OpenAI expects them inline in a content array as data URLs. Without this
+    translation the images key is simply unknown to llama-server and the
+    attached picture is silently ignored.
+
+    Text-only messages keep plain string content, which is what the rest of
+    the pipeline (truncation, merging) expects.
+    """
+    role = msg.get("role", "user")
+    text = msg.get("content", "") or ""
+    images = msg.get("images") or []
+    if not images:
+        return {"role": role, "content": text}
+    parts = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for b64 in images:
+        if not b64:
+            continue
+        b64 = str(b64)
+        url = b64 if b64.startswith("data:") else f"data:{_b64_image_mime(b64)};base64,{b64}"
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return {"role": role, "content": parts}
+
+# Markers that identify a multimodal (vision) chat model. Kept in sync with
+# VISION_MODELS in FastChatUI.html, including the separator normalization in
+# _looks_like_vision_model() / isVision().
+VISION_MODEL_MARKERS = (
+    "-vl-", "vision", "llava", "bakllava", "moondream",
+    "smolvlm", "minicpm-v", "cogvlm", "pixtral", "internvl", "gemma-3",
+)
+
+def _looks_like_vision_model(name):
+    """Heuristic: does this model name/filename denote a multimodal model?
+
+    Normalizes spaces, underscores and dots to hyphens so the same markers
+    match both a raw filename ("Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf") and the
+    display name the UI sees ("Qwen2.5 VL 3B Instruct Q4 K M").
+    """
+    base = os.path.basename(str(name or "")).lower()
+    normalized = "-" + re.sub(r"[\s_.]+", "-", base) + "-"
+    return any(marker in normalized for marker in VISION_MODEL_MARKERS)
+
+def _find_mmproj_for_model(model_path):
+    """Locate the multimodal projector (mmproj) GGUF paired with a model.
+
+    Vision models ship as two files — the language model and a separate mmproj
+    projector — and llama-server needs --mmproj to accept images at all. There
+    is no metadata link between the pair, so match on filename.
+
+    Returns None for text-only models even when a projector is present in the
+    folder: attaching a mismatched projector makes llama-server fail outright
+    with "mismatch between text model (n_embd = ...) and mmproj (n_embd = ...)",
+    so a wrong guess is far worse than no guess.
+    """
+    if not model_path:
+        return None
+    models_dir = os.path.dirname(os.path.abspath(model_path))
+    base = os.path.basename(model_path)
+    if "mmproj" in base.lower():
+        return None  # the projector itself is not a chat model
+    # "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf" -> "qwen2.5-vl-3b-instruct"
+    stem = os.path.splitext(base)[0].lower()
+    stem = re.sub(r"[-_.](iq|q)\d[^-_.]*([-_.][km][a-z]?)?$", "", stem)
+    stem = re.sub(r"[-_.]f(16|32)$", "", stem)
+    try:
+        candidates = [f for f in sorted(os.listdir(models_dir))
+                      if f.lower().endswith(".gguf") and "mmproj" in f.lower()]
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    # Prefer a projector whose filename references this specific model
+    for fname in candidates:
+        if stem and stem in fname.lower():
+            return os.path.join(models_dir, fname)
+    # Fall back to a lone projector only when this model actually looks
+    # multimodal — some publishers name the projector generically
+    # (e.g. gemma-3 ships "mmproj-model-f16.gguf" with no model reference).
+    if len(candidates) == 1 and _looks_like_vision_model(model_path):
+        return os.path.join(models_dir, candidates[0])
+    return None
+
 def _truncate_text_middle(text, max_chars):
     """Shorten text to max_chars while keeping both the head and the tail.
 
@@ -947,6 +1054,13 @@ def _start_llama(model_path, job_id=None):
         chat_template = _detect_chat_template(model_path)
         if chat_template:
             cmd += ["--chat-template", chat_template]
+
+        # Vision models need their paired projector loaded explicitly, otherwise
+        # llama-server starts fine but rejects every image with
+        # "image input is not supported".
+        mmproj_path = _find_mmproj_for_model(model_path)
+        if mmproj_path:
+            cmd += ["--mmproj", mmproj_path]
         
         # Capture stderr for progress tracking; stdout to devnull
         with _LLAMA_PROC_LOCK:
@@ -2489,10 +2603,15 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
                 # Merge consecutive same-role messages — gemma (and many other models)
                 # require strict user/assistant alternation in their chat templates.
+                # Attached images are carried across a merge too, otherwise merging
+                # a text turn into an image turn would drop the picture.
                 merged_messages = []
                 for msg in raw_messages:
                     if merged_messages and merged_messages[-1]["role"] == msg["role"]:
                         merged_messages[-1]["content"] = (merged_messages[-1]["content"] or "") + "\n" + (msg["content"] or "")
+                        if msg.get("images"):
+                            merged_messages[-1].setdefault("images", [])
+                            merged_messages[-1]["images"] = list(merged_messages[-1]["images"]) + list(msg["images"])
                     else:
                         merged_messages.append(dict(msg))
 
@@ -2516,9 +2635,13 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                                         break
                                 break
 
+                # Translate to OpenAI format last, so truncation and merging above
+                # both operate on plain string content.
+                openai_messages = [_ollama_msg_to_openai(m) for m in merged_messages]
+
                 openai_req = {
                     "model": ollama_req.get("model", "local"),
-                    "messages": merged_messages,
+                    "messages": openai_messages,
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
                 }

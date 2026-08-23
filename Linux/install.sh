@@ -420,10 +420,53 @@ download_model() {
         echo -e "${DGR}      ${URL}${RST}"
         echo -e "${DGR}      Place the file in: ${MODELS_DIR}/${RST}"
     fi
+
+}
+
+# Vision models ship a second file: the multimodal projector (mmproj). Without
+# it llama-server loads fine but refuses every image, so a missing projector is
+# a real failure, not a silent downgrade. Kept separate from download_model()
+# because that function returns early when the main GGUF is already present —
+# the projector still has to be fetched on a re-run.
+download_mmproj() {
+    local NUM=$1
+    local MMFILE MMURL MMMINB MMDEST NAME MM_OK
+    MMFILE=$(get_field "$NUM" MMPROJ_FILE)
+    MMURL=$(get_field "$NUM" MMPROJ_URL)
+    if [ -z "$MMFILE" ] || [ -z "$MMURL" ]; then
+        return 0
+    fi
+    NAME=$(get_field "$NUM" NAME)
+    MMMINB=$(get_field "$NUM" MMPROJ_MINB)
+    [ -z "$MMMINB" ] && MMMINB=1000000
+    MMDEST="$MODELS_DIR/$MMFILE"
+
+    echo -e "  ${YLW}      + vision projector (${MMFILE})${RST}"
+    if file_ok "$MMDEST" "$MMMINB"; then
+        echo -e "${GRN}      Projector already downloaded! Skipping...${RST}"
+        return 0
+    fi
+    if copy_from_drive_root "$MMFILE" "$MMDEST" "$MMMINB"; then
+        return 0
+    fi
+    MM_OK=false
+    for ATTEMPT in 1 2; do
+        [ "$ATTEMPT" -gt 1 ] && echo -e "${YLW}      Retry attempt ${ATTEMPT}...${RST}"
+        curl -L "$MMURL" -o "$MMDEST"
+        if file_ok "$MMDEST" "$MMMINB"; then MM_OK=true; break; fi
+    done
+    if $MM_OK; then
+        echo -e "${GRN}      Projector download complete!${RST}"
+    else
+        DOWNLOAD_ERRORS+=("$NAME (vision projector)")
+        echo -e "${RED}      ERROR: Projector download failed - image input will not work!${RST}"
+        echo -e "${DGR}      ${MMURL}${RST}"
+    fi
 }
 
 for NUM in "${SELECTED_NUMS[@]}"; do
     download_model "$NUM"
+    download_mmproj "$NUM"
 done
 
 # Custom model download
@@ -471,8 +514,21 @@ for NUM in "${SELECTED_NUMS[@]}"; do
     NAME=$(get_field "$NUM" NAME)
     write_modelfile "$LOCAL" "$FILE" "$PROMPT"
     echo -e "${GRN}      Config: ${NAME} -> ${LOCAL}${RST}"
-    [ -z "$FIRST_LOCAL" ] && FIRST_LOCAL="$LOCAL" && FIRST_FILE="$FILE" && FIRST_PROMPT="$PROMPT"
+    # The legacy default Modelfile feeds Ollama, so prefer a model Ollama can
+    # actually run; llama.cpp-only models are only used as a last resort below.
+    if [ "$(get_field "$NUM" ENGINE)" != "llama" ]; then
+        [ -z "$FIRST_LOCAL" ] && FIRST_LOCAL="$LOCAL" && FIRST_FILE="$FILE" && FIRST_PROMPT="$PROMPT"
+    fi
 done
+
+# Fallback: nothing Ollama-capable was selected (e.g. only the vision model),
+# so the default still has to point somewhere valid.
+if [ -z "$FIRST_LOCAL" ] && [ ${#SELECTED_NUMS[@]} -gt 0 ]; then
+    FALLBACK_NUM=${SELECTED_NUMS[0]}
+    FIRST_LOCAL=$(get_field "$FALLBACK_NUM" LOCAL)
+    FIRST_FILE=$(get_field "$FALLBACK_NUM" FILE)
+    FIRST_PROMPT=$(get_field "$FALLBACK_NUM" PROMPT)
+fi
 
 if $HAS_CUSTOM && [ -n "$CUSTOM_URL" ]; then
     write_modelfile "$CUSTOM_LOCAL" "$CUSTOM_FILE" "$CUSTOM_PROMPT"
@@ -756,6 +812,14 @@ else
         NAME=$(get_field "$NUM" NAME)
         FILE=$(get_field "$NUM" FILE)
         MINB=$(get_field "$NUM" MINB)
+        # Models pinned to llama.cpp (vision GGUFs) are deliberately not
+        # imported into Ollama: 'ollama create' from a bare GGUF cannot attach
+        # the mmproj projector, so the import would appear to succeed and then
+        # silently ignore every attached image.
+        if [ "$(get_field "$NUM" ENGINE)" = "llama" ]; then
+            echo -e "${DGR}      Skipping ${NAME} for Ollama (llama.cpp engine only)${RST}"
+            continue
+        fi
         import_model "$LOCAL" "$NAME" "$FILE" "$MINB"
     done
 

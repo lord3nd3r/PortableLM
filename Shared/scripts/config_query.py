@@ -23,7 +23,12 @@ def shell_quote(value) -> str:
 def emit_models_shell(models):
     nums = [str(m.get("num", "")) for m in models if m.get("num") is not None]
     print(f"MODEL_NUMS=({' '.join(nums)})")
-    fields = ("NAME", "FILE", "URL", "SIZE", "MINB", "LOCAL", "LABEL", "BADGE", "PROMPT")
+    # MMPROJ_* describe the optional multimodal projector that vision models
+    # ship alongside their main GGUF; ENGINE pins a model to one chat engine
+    # (vision GGUFs only work under llama.cpp, which can load --mmproj).
+    # All four are empty strings for ordinary text models.
+    fields = ("NAME", "FILE", "URL", "SIZE", "MINB", "LOCAL", "LABEL", "BADGE", "PROMPT",
+              "MMPROJ_FILE", "MMPROJ_URL", "MMPROJ_MINB", "ENGINE")
     key_map = {
         "NAME": "name",
         "FILE": "file",
@@ -34,6 +39,10 @@ def emit_models_shell(models):
         "LABEL": "label",
         "BADGE": "badge",
         "PROMPT": "prompt",
+        "MMPROJ_FILE": "mmproj_file",
+        "MMPROJ_URL": "mmproj_url",
+        "MMPROJ_MINB": "mmproj_min_bytes",
+        "ENGINE": "engine",
     }
     for m in models:
         num = m.get("num")
