@@ -1235,6 +1235,40 @@
       .mab.dlk {
         color: var(--red);
       }
+      /* Tool execution inside a chat message */
+      .tool-run {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+        padding: 8px 12px;
+        background: var(--bg2);
+        border: 1px solid var(--bd);
+        border-radius: 10px;
+        color: var(--t2);
+        font-size: 13px;
+      }
+      .tool-run i {
+        color: var(--grad1);
+      }
+      .tool-img {
+        margin-top: 10px;
+      }
+      .tool-img img {
+        max-width: min(420px, 100%);
+        border-radius: 12px;
+        border: 1px solid var(--bd);
+        cursor: zoom-in;
+        display: block;
+      }
+      .tool-cap {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--t3);
+        max-width: min(420px, 100%);
+        line-height: 1.4;
+      }
+
       /* Currently being read aloud — kept visible even when the row isn't
          hovered, so there is always a reachable stop control. */
       .mab.spk-on {
@@ -2335,6 +2369,20 @@
           </button>
         </div>
         <hr class="sys-divider" />
+        <div class="sys-row">
+          <label for="tools-enabled">Tool calling</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+            <label class="sys-hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="tools-enabled" />
+              Let the model generate images on request
+            </label>
+            <span class="sys-hint">
+              llama.cpp only. Changing this restarts the chat engine, since it
+              needs a tool-capable chat template.
+            </span>
+          </div>
+        </div>
+        <hr class="sys-divider" />
         <!-- Hidden until the server reports a piper binary + at least one voice -->
         <div id="tts-settings" style="display:none">
           <div class="sys-row">
@@ -2922,6 +2970,9 @@
             const s = await r.json();
             S.globalSys = s.globalSystemPrompt || '';
             S.logMode = s.logMode === 'all' ? 'all' : 'errors_only';
+            S.toolsEnabled = !!s.toolsEnabled;
+            const tb = document.getElementById('tools-enabled');
+            if (tb) tb.checked = S.toolsEnabled;
           }
         } catch { }
       } else {
@@ -3351,6 +3402,22 @@
       }
 
       // ── Image Lightbox ─────────────────────────────────────────
+      // In-chat tool images are referenced by src (a URL for persisted files,
+      // or a data: URI as a fallback), so reuse the modal with a plain src.
+      function openToolImg(src) {
+        if (!src) return;
+        D.imgModalImg.src = src;
+        D.imgModal.classList.add('on');
+        D.imgModalDownload.onclick = () => {
+          const link = document.createElement('a');
+          link.href = src;
+          link.download = `generated_${Date.now()}.png`;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+        };
+      }
+
       function openImgModal(b64Data, mimeType) {
         D.imgModalImg.src = `data:${mimeType};base64,${b64Data}`;
         D.imgModal.classList.add('on');
@@ -3823,6 +3890,7 @@
             '<div class="typ"><span></span><span></span><span></span></div>';
 
         S.abort = new AbortController();
+        let pendingToolCalls = null;
         let apiMsgs = [];
         if (conv.sys) apiMsgs.push({ role: 'system', content: conv.sys });
         conv.msgs.slice(0, -1).forEach((m) => {
@@ -3854,14 +3922,22 @@
           const readerStartEl = getContentEl();
           if (readerStartEl) readerStartEl.innerHTML = '';
 
+          // Buffer partial lines: a read() can split a JSONL frame mid-object,
+          // and JSON.parse on the half would silently drop that token.
+          let lineBuf = '';
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = dec.decode(value, { stream: true });
-            for (const line of chunk.split('\n')) {
+            lineBuf += dec.decode(value, { stream: true });
+            const lines = lineBuf.split('\n');
+            lineBuf = lines.pop(); // incomplete tail, completed by a later read
+            for (const line of lines) {
               if (!line.trim()) continue;
               try {
                 const p = JSON.parse(line);
+                if (p.message?.tool_calls?.length) {
+                  pendingToolCalls = p.message.tool_calls;
+                }
                 if (p.message?.content) {
                   aiMsg.content += p.message.content;
                   const streamEl = getContentEl();
@@ -3878,6 +3954,7 @@
               if (!b.classList.contains('hljs')) hljs.highlightElement(b);
             });
           }
+          if (pendingToolCalls) await runToolCalls(pendingToolCalls, aiMsg);
         } catch (err) {
           const errEl = getContentEl();
           if (err.name === 'AbortError') {
@@ -3910,6 +3987,98 @@
 
       function stopStream() {
         if (S.abort) S.abort.abort();
+      }
+
+      // ── Tool calling ─────────────────────────────────────────
+      // Tools run in the browser rather than inside the proxy: image
+      // generation is an async job with progress polling, and the UI already
+      // owns that flow. Only the fixed allowlist below is dispatchable — an
+      // unrecognized name is reported, never executed.
+      async function runToolCalls(calls, aiMsg) {
+        for (const call of calls) {
+          const name = call?.function?.name;
+          const args = call?.function?.arguments || {};
+          if (name === 'generate_image') {
+            await runImageTool(String(args.prompt || '').trim(), aiMsg);
+          } else {
+            aiMsg.toolStatus = null;
+            aiMsg.content += `\n\n_Requested an unavailable tool: ${name || 'unknown'}._`;
+            renderChat();
+          }
+        }
+        save();
+      }
+
+      async function runImageTool(prompt, aiMsg) {
+        if (!prompt) {
+          aiMsg.content += '\n\n_No image description was provided._';
+          renderChat();
+          return;
+        }
+        aiMsg.toolPrompt = prompt;
+        aiMsg.toolStatus = 'Generating image...';
+        renderChat();
+        scrollEnd();
+
+        try {
+          const r = await fetch('/api/generate-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            // persist: keep the PNG on disk so the transcript can reference a
+            // URL instead of storing base64 in chats.json.
+            body: JSON.stringify({ prompt, persist: true }),
+          });
+          const d = await r.json();
+          if (!r.ok || d.error) {
+            aiMsg.toolStatus = null;
+            aiMsg.content += `\n\n_Image generation failed: ${d.error || 'unknown error'}_`;
+            renderChat();
+            return;
+          }
+
+          // Poll the existing progress endpoint, same cadence as the image panel.
+          const jobId = d.job_id;
+          const maxPolls = 600;
+          for (let i = 0; i < maxPolls; i++) {
+            await new Promise((res) => setTimeout(res, 1200));
+            let pd;
+            try {
+              const pr = await fetch(
+                `/api/image-progress?job_id=${encodeURIComponent(jobId)}`,
+              );
+              pd = await pr.json();
+              if (!pr.ok) continue;
+            } catch {
+              continue;
+            }
+            if (pd.status === 'done') {
+              aiMsg.toolStatus = null;
+              aiMsg.toolImage =
+                pd.image_url ||
+                `data:${pd.mime_type || 'image/png'};base64,${pd.image_b64}`;
+              renderChat();
+              scrollEnd();
+              return;
+            }
+            if (pd.status === 'error') {
+              aiMsg.toolStatus = null;
+              aiMsg.content += `\n\n_Image generation failed: ${pd.error || 'unknown error'}_`;
+              renderChat();
+              return;
+            }
+            if (pd.total_steps > 0) {
+              aiMsg.toolStatus = `Generating image... step ${pd.step}/${pd.total_steps}`;
+              renderChat();
+            }
+          }
+          aiMsg.toolStatus = null;
+          aiMsg.content += '\n\n_Image generation timed out._';
+          renderChat();
+        } catch {
+          aiMsg.toolStatus = null;
+          aiMsg.content += '\n\n_Could not reach the image engine._';
+          renderChat();
+        }
       }
 
       // ÔöÇÔöÇ Markdown ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
@@ -4096,9 +4265,18 @@
         </div>`
             : '';
 
+        // Tool output lives outside .mt so streaming writes to the text node
+        // never clobber a generated image.
+        const toolRunning = msg.toolStatus
+          ? `<div class="tool-run"><i class="fa-solid fa-wand-magic-sparkles"></i> ${esc(msg.toolStatus)}</div>`
+          : '';
+        const toolImg = msg.toolImage
+          ? `<div class="tool-img"><img src="${esc(msg.toolImage)}" alt="${esc(msg.toolPrompt || 'Generated image')}" loading="lazy" onclick="openToolImg(this.src)"><div class="tool-cap">${esc(msg.toolPrompt || '')}</div></div>`
+          : '';
+
         return `<div class="mr">
         <div class="ma ai"><svg viewBox="0 0 24 24"><path d="M12 2L14.09 8.26L21 9.27L16 14.14L17.18 21.02L12 17.77L6.82 21.02L8 14.14L3 9.27L9.91 8.26L12 2Z" fill="white"/></svg></div>
-        <div class="mc"><div class="mt">${parsed || ''}</div>${actions}</div>
+        <div class="mc"><div class="mt">${parsed || ''}</div>${toolRunning}${toolImg}${actions}</div>
     </div>`;
       }
 
@@ -4631,6 +4809,31 @@
 
       const micBtn = document.getElementById('mic-btn');
       if (micBtn) micBtn.addEventListener('click', toggleDictation);
+
+      // Tool calling. Persisted server-side (unlike the per-device voice
+      // prefs) because llama-server has to be started with a tool-capable
+      // template for it to work at all.
+      const toolsBox = document.getElementById('tools-enabled');
+      if (toolsBox) {
+        toolsBox.addEventListener('change', async () => {
+          try {
+            await fetch('/api/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ toolsEnabled: toolsBox.checked }),
+            });
+            S.toolsEnabled = toolsBox.checked;
+            toast(
+              toolsBox.checked
+                ? 'Tool calling on — re-apply the llama.cpp engine to load it.'
+                : 'Tool calling off — re-apply the engine to unload it.',
+            );
+          } catch {
+            toolsBox.checked = !toolsBox.checked;
+            toast('Could not save that setting.');
+          }
+        });
+      }
 
       // Text-to-speech controls (stored per device, like the theme)
       const ttsVoiceSel = document.getElementById('tts-voice-select');

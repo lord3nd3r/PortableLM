@@ -1010,6 +1010,43 @@ def _detect_chat_template(model_path):
     # ChatML family (Phi-3, older Qwen, etc.) — usually embedded, skip
     return None
 
+# ── Tool calling ───────────────────────────────────────────────
+# Deliberately a fixed allowlist of typed operations rather than anything
+# resembling a generic "run this command": the catalog ships abliterated
+# models with refusal training removed, and dictated input is frequently
+# misheard, so the worst outcome of a bad call must stay harmless.
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image from a text description. Use this whenever the user "
+                "asks for a picture, image, drawing, painting, photo or render of something."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed visual description of the image to create.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+]
+
+TOOL_CHAT_TEMPLATE = os.path.join(SCRIPT_DIR, "config", "chat-templates", "qwen3-tools.jinja")
+
+def _tools_enabled():
+    """Whether tool calling is switched on in settings (off by default)."""
+    try:
+        return bool(_load_settings_file().get("toolsEnabled", False))
+    except Exception:
+        return False
+
 def _estimate_tokens(text):
     """Rough token count estimate: ~4 chars per token for English text."""
     if not text:
@@ -1269,9 +1306,20 @@ def _start_llama(model_path, job_id=None):
             "--ctx-size", "4096",
             "--n-predict", "-1",
         ]
-        chat_template = _detect_chat_template(model_path)
-        if chat_template:
-            cmd += ["--chat-template", chat_template]
+        # Tool calling needs --jinja plus a template that actually handles
+        # tools. Abliterated finetunes routinely ship a stripped ChatML
+        # template with no <tools> block, in which case llama-server accepts
+        # the tools parameter and silently never emits a tool_call — so the
+        # bundled template is passed explicitly. Only applied when tool calling
+        # is switched on, since overriding a model's template otherwise risks
+        # regressing ordinary chat formatting.
+        use_tools = _tools_enabled() and os.path.isfile(TOOL_CHAT_TEMPLATE)
+        if use_tools:
+            cmd += ["--jinja", "--chat-template-file", TOOL_CHAT_TEMPLATE]
+        else:
+            chat_template = _detect_chat_template(model_path)
+            if chat_template:
+                cmd += ["--chat-template", chat_template]
 
         # Vision models need their paired projector loaded explicitly, otherwise
         # llama-server starts fine but rejects every image with
@@ -1697,11 +1745,17 @@ def _run_sd_generation(job_id, payload, output_path):
             img_bytes = f.read()
         img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        # Clean up temp file
-        try:
-            os.remove(output_path)
-        except Exception:
-            pass
+        # Images placed into the chat transcript are kept on disk and referenced
+        # by URL. Embedding the base64 in chats.json instead would add ~1.5 MB
+        # per image to a file that is rewritten on every debounced save.
+        image_url = None
+        if payload.get("persist"):
+            image_url = "/chat_data/generated_images/" + os.path.basename(output_path)
+        else:
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
 
         job = _get_image_job(job_id)
         started_at = job.get("started_at", time.time())
@@ -1709,6 +1763,7 @@ def _run_sd_generation(job_id, payload, output_path):
             job_id,
             status="done",
             image_b64=img_b64,
+            image_url=image_url,
             elapsed_ms=int((time.time() - started_at) * 1000),
         )
     except Exception as e:
@@ -2646,6 +2701,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         if job.get("status") == "done":
             resp["image_b64"] = job.get("image_b64")
             resp["mime_type"] = "image/png"
+            # Present only for persisted images (the in-chat tool path), so the
+            # transcript can reference a URL instead of storing base64.
+            if job.get("image_url"):
+                resp["image_url"] = job["image_url"]
         elif job.get("status") == "error":
             resp["error"] = job.get("error", "Unknown error.")
 
@@ -3009,6 +3068,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     "stream": True,
                     "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
                 }
+                if _tools_enabled():
+                    openai_req["tools"] = TOOL_DEFINITIONS
+                    openai_req["tool_choice"] = "auto"
                 target_url = chat_host + "/v1/chat/completions"
                 body = json.dumps(openai_req).encode()
 
@@ -3043,6 +3105,49 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     request_context=request_context,
                 )
 
+            # Buffer partial SSE lines across chunk boundaries. read(4096) can
+            # split a frame mid-JSON, and a half-frame silently fails to parse —
+            # losing a token of content, or corrupting tool-call arguments,
+            # which arrive split across dozens of frames.
+            sse_buffer = ""
+            # Tool calls stream incrementally: the first frame carries the id and
+            # function name, later frames append fragments of the JSON arguments.
+            # Accumulate by index and emit once, when the stream signals it's done.
+            tool_acc = {}
+
+            def emit(obj):
+                """Write one Ollama-format JSONL frame. False if the client is gone."""
+                try:
+                    self.wfile.write((json.dumps(obj) + "\n").encode())
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return False
+
+            def collected_tool_calls():
+                calls = []
+                for idx in sorted(tool_acc):
+                    slot = tool_acc[idx]
+                    if not slot.get("name"):
+                        continue
+                    try:
+                        # Ollama represents arguments as an object, OpenAI as a
+                        # JSON string, so parse before handing it to the client.
+                        args = json.loads(slot.get("arguments") or "{}")
+                    except Exception:
+                        args = {}
+                    calls.append({"function": {"name": slot["name"], "arguments": args}})
+                return calls
+
+            def emit_done():
+                # Final frame in Ollama's format so clients relying on
+                # "done": true don't hang, carrying any tool calls collected.
+                final = {"message": {"role": "assistant", "content": ""}, "done": True}
+                calls = collected_tool_calls()
+                if calls:
+                    final["message"]["tool_calls"] = calls
+                emit(final)
+
             # Stream the response in chunks
             while True:
                 chunk = response.read(4096)
@@ -3051,51 +3156,59 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
                 # If bridging llama.cpp SSE to Ollama JSONL
                 if active == "llama" and is_stream:
-                    text = chunk.decode(errors="ignore")
-                    lines = text.split("\n")
+                    sse_buffer += chunk.decode(errors="ignore")
+                    lines = sse_buffer.split("\n")
+                    # Keep the trailing fragment; it completes in a later chunk.
+                    sse_buffer = lines.pop()
                     for line in lines:
-                        if line.startswith("data: "):
-                            data = line[6:].strip()
-                            if data == "[DONE]":
-                                # Signal completion in the Ollama JSONL format
-                                # so clients relying on a final "done": true
-                                # frame don't hang waiting for one.
-                                try:
-                                    self.wfile.write((json.dumps({
-                                        "message": {"role": "assistant", "content": ""},
-                                        "done": True,
-                                    }) + "\n").encode())
-                                    self.wfile.flush()
-                                except (BrokenPipeError, ConnectionResetError, OSError):
-                                    pass
-                                return
-                            try:
-                                j = json.loads(data)
-                                if "choices" in j and len(j["choices"]) > 0:
-                                    delta = j["choices"][0].get("delta", {})
-                                    out = {
-                                        # `or ""` rather than a .get() default: llama.cpp
-                                        # sends an explicit "content": null on some deltas
-                                        # (e.g. the opening role-only frame), and the key
-                                        # existing means .get()'s default never applies.
-                                        # Ollama's format always sends a string, so clients
-                                        # doing `content += chunk.message.content` break on null.
-                                        "message": {"role": "assistant", "content": delta.get("content") or ""},
-                                        "done": False
-                                    }
-                                    try:
-                                        self.wfile.write((json.dumps(out) + "\n").encode())
-                                        self.wfile.flush()
-                                    except (BrokenPipeError, ConnectionResetError, OSError):
-                                        _log_event(
-                                            logging.ERROR,
-                                            "Client disconnected while streaming response",
-                                            request_context=request_context,
-                                            exc_info=True,
-                                        )
-                                        return
-                            except:
-                                pass
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            emit_done()
+                            return
+                        try:
+                            j = json.loads(data)
+                        except Exception:
+                            continue
+                        choices = j.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+
+                        for tc in delta.get("tool_calls") or []:
+                            slot = tool_acc.setdefault(
+                                tc.get("index", 0), {"name": "", "arguments": ""}
+                            )
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["arguments"] += fn["arguments"]
+
+                        if choice.get("finish_reason") == "tool_calls":
+                            emit_done()
+                            return
+
+                        # `or ""` rather than a .get() default: llama.cpp sends an
+                        # explicit "content": null on some deltas (e.g. the opening
+                        # role-only frame), and the key existing means .get()'s
+                        # default never applies. Ollama always sends a string, so
+                        # clients doing `content += chunk.message.content` break on null.
+                        content = delta.get("content") or ""
+                        if content and not emit({
+                            "message": {"role": "assistant", "content": content},
+                            "done": False,
+                        }):
+                            _log_event(
+                                logging.ERROR,
+                                "Client disconnected while streaming response",
+                                request_context=request_context,
+                                exc_info=True,
+                            )
+                            return
                 else:
                     try:
                         self.wfile.write(chunk)
