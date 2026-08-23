@@ -6,8 +6,14 @@ Shared/vendor/
 # Runtime data
 Shared/chat_data/
 Shared/logs/
+# Created by ollama at startup — holds its identity keypair, never commit it
+Shared/.ollama-runtime/
 
 # OS files
 .DS_Store
 Thumbs.db
 __pycache__/
+
+# Local AI session files (not for git)
+CLAUDE.md
+.claude/
