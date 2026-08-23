@@ -793,74 +793,123 @@ def _estimate_tokens(text):
         return 0
     return max(1, len(text) // 4)
 
+def _truncate_text_middle(text, max_chars):
+    """Shorten text to max_chars while keeping both the head and the tail.
+
+    Attachment-bearing messages are built by the UI as
+    "Attached document context: <document> --- User: <question>", so the user's
+    actual question sits at the very END of the string. Cutting from the tail
+    would keep the document and silently discard the question, so cut from the
+    middle instead and keep both ends.
+    """
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n[... middle of content truncated to fit context window ...]\n\n"
+    if max_chars <= len(marker):
+        # No room for both ends plus a marker — the trailing question matters
+        # more than the head of the document, so keep the tail.
+        return text[-max_chars:]
+    budget = max_chars - len(marker)
+    head = (budget * 2) // 3
+    tail = budget - head
+    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
+
 def _truncate_messages_to_context(messages, max_tokens=3500, reserve_for_response=500):
     """
     Truncate a list of chat messages to fit within context window.
-    
+
     Keeps the most recent messages, dropping older ones from the middle.
-    Always preserves: first message (often system/context) and last few exchanges.
-    
+    Always preserves the first message (often system/context) AND the newest
+    message, which is the user's current turn.
+
+    The newest message is never dropped: if it alone exceeds the budget (the
+    usual cause is an attached document), its content is truncated middle-out
+    via _truncate_text_middle() instead. Dropping it entirely would send the
+    model a conversation whose latest turn is a stale earlier question, which
+    it would then answer as if it were current.
+
     Args:
         messages: List of {"role": str, "content": str} dicts
         max_tokens: Maximum context size (default 3500, leaving room for model overhead)
         reserve_for_response: Tokens to reserve for model response
-    
+
     Returns:
         Truncated message list, truncation_notice (str or None)
     """
     if not messages:
         return messages, None
-    
+
     available = max_tokens - reserve_for_response
-    
+
     # Calculate current token usage
     def msg_tokens(msg):
         return _estimate_tokens(msg.get("content", "")) + 4  # +4 for role/formatting overhead
-    
-    total_tokens = sum(msg_tokens(m) for m in messages)
-    
-    if total_tokens <= available:
+
+    if sum(msg_tokens(m) for m in messages) <= available:
         return messages, None  # No truncation needed
-    
-    # Strategy: Keep first message (system context) + as many recent messages as fit
-    result = []
-    truncation_notice = None
-    
-    if len(messages) <= 2:
-        # Only 1-2 messages, can't truncate meaningfully
-        return messages, None
-    
-    # Always keep the first message (usually system or important context)
-    first_msg = messages[0]
-    first_tokens = msg_tokens(first_msg)
-    
-    # Build from the end (most recent), tracking tokens
-    recent_messages = []
-    recent_tokens = 0
-    
-    for msg in reversed(messages[1:]):
+
+    # Budget for the truncation notice we are about to insert, so adding it
+    # doesn't push us back over the limit.
+    NOTICE_TOKENS = 32
+    # Never emit an empty newest message, even if the first message is so large
+    # that it consumes the whole budget on its own.
+    MIN_NEWEST_CHARS = 400
+
+    # Copy the messages we mutate so we never modify the caller's dicts.
+    newest = dict(messages[-1])
+    preceding = list(messages[:-1])
+
+    # Always keep the first message too (usually the system prompt) — unless
+    # the newest message IS the first message.
+    first_msg = dict(preceding[0]) if preceding else None
+    first_tokens = msg_tokens(first_msg) if first_msg else 0
+
+    # Give the newest message whatever the first message and notice don't need.
+    newest_budget = available - first_tokens - NOTICE_TOKENS
+    content_truncated = False
+    if msg_tokens(newest) > newest_budget:
+        # msg_tokens() adds 4 for overhead; _estimate_tokens() is ~4 chars/token.
+        max_chars = max(MIN_NEWEST_CHARS, (newest_budget - 4) * 4)
+        original_content = newest.get("content", "") or ""
+        shortened = _truncate_text_middle(original_content, max_chars)
+        # Only claim a truncation if we actually removed something — the
+        # MIN_NEWEST_CHARS floor can leave a short message fully intact even
+        # when the budget was already blown by an oversized first message.
+        if len(shortened) < len(original_content):
+            newest["content"] = shortened
+            content_truncated = True
+
+    # Fill the remaining budget with the most recent preceding messages.
+    used = first_tokens + msg_tokens(newest) + NOTICE_TOKENS
+    kept = []
+    for msg in reversed(preceding[1:]):
         tokens = msg_tokens(msg)
-        if recent_tokens + tokens + first_tokens <= available:
-            recent_messages.insert(0, msg)
-            recent_tokens += tokens
-        else:
-            # Skip this one oversized message rather than stopping the whole
-            # scan, so a single huge message doesn't zero out all the older,
-            # smaller messages that would still fit within budget.
-            continue
-    
-    # Count how many messages were dropped
-    dropped_count = len(messages) - 1 - len(recent_messages)
-    
-    if dropped_count > 0:
-        result = [first_msg] + recent_messages
+        if used + tokens <= available:
+            kept.insert(0, msg)
+            used += tokens
+
+    dropped_count = (len(preceding) - 1 - len(kept)) if preceding else 0
+
+    result = ([first_msg] if first_msg else []) + kept + [newest]
+
+    # Every notice variant must contain the literal word "truncated" — the
+    # Gemma system-folding path in _proxy_ollama() matches on it.
+    if dropped_count > 0 and content_truncated:
+        truncation_notice = f"[{dropped_count} earlier message(s) and latest message truncated to fit context window]"
+    elif dropped_count > 0:
         truncation_notice = f"[{dropped_count} earlier message(s) truncated to fit context window]"
-        
-        # Insert truncation notice as a system message after the first message
-        result.insert(1, {"role": "system", "content": truncation_notice})
+    elif content_truncated:
+        truncation_notice = "[latest message truncated to fit context window]"
     else:
-        result = [first_msg] + recent_messages
-    
+        truncation_notice = None
+
+    if truncation_notice:
+        # Insert the notice right after the first message (or at the front when
+        # there is no preceding message to anchor to).
+        result.insert(1 if first_msg else 0, {"role": "system", "content": truncation_notice})
+
     return result, truncation_notice
 
 def _start_llama(model_path, job_id=None):
