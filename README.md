@@ -189,7 +189,7 @@ model call the image engine itself:
 | Engine | What's needed |
 |---|---|
 | **Ollama** | Nothing — takes effect immediately. Registry models ship tool-capable templates. |
-| **llama.cpp** | Re-apply the engine after toggling. llama-server picks its chat template at startup, and PortableLM supplies a tool-capable one (many abliterated GGUFs ship a stripped template with no tool support, which is why the model would otherwise never call anything). |
+| **llama.cpp** | Re-apply the engine after toggling. llama-server picks its chat template at startup, and PortableLM chooses one per model: a model whose own template already asks for `<tool_call>` JSON keeps it, everything else is handed a tool-capable template (many abliterated GGUFs ship a stripped template with no tool support, and some declare tools in a syntax llama-server won't parse — either way the model would otherwise never call anything). |
 
 Models that can't do tool calls keep chatting normally — the request is retried without
 tools rather than failing.

@@ -28,6 +28,7 @@ import uuid
 import subprocess
 import base64
 import re
+import struct
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
@@ -1147,6 +1148,63 @@ def _detect_chat_template(model_path):
     # ChatML family (Phi-3, older Qwen, etc.) — usually embedded, skip
     return None
 
+# ── GGUF metadata ──────────────────────────────────────────────
+# Value type ids from the GGUF spec. The sizes cover the fixed-width types;
+# strings (8) and arrays (9) carry their own length prefix.
+_GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+
+def _gguf_read_string(f):
+    length, = struct.unpack("<Q", f.read(8))
+    return f.read(length)
+
+def _gguf_skip_value(f, vtype):
+    """Advance past one metadata value without reading it into memory."""
+    if vtype == _GGUF_TYPE_STRING:
+        length, = struct.unpack("<Q", f.read(8))
+        f.seek(length, 1)
+    elif vtype == _GGUF_TYPE_ARRAY:
+        item_type, count = struct.unpack("<IQ", f.read(12))
+        if item_type == _GGUF_TYPE_STRING:
+            # The token list lives here — a few hundred thousand entries — so
+            # seek past each one rather than materialising any of it.
+            for _ in range(count):
+                length, = struct.unpack("<Q", f.read(8))
+                f.seek(length, 1)
+        else:
+            f.seek(_GGUF_SCALAR_SIZES[item_type] * count, 1)
+    else:
+        f.seek(_GGUF_SCALAR_SIZES[vtype], 1)
+
+def _gguf_chat_template(model_path):
+    """Return the chat template embedded in a GGUF file, or None if it has none.
+
+    Metadata sits in the file header ahead of the tensor data, so this touches
+    a few hundred KB of a multi-GB file (~0.1s) and never loads the model.
+    Any malformed or unexpected layout returns None, which callers treat the
+    same as "no template".
+    """
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            version, = struct.unpack("<I", f.read(4))
+            if version not in (2, 3):   # v1 used 32-bit lengths; long extinct
+                return None
+            _tensor_count, kv_count = struct.unpack("<QQ", f.read(16))
+            for _ in range(kv_count):
+                key = _gguf_read_string(f)
+                vtype, = struct.unpack("<I", f.read(4))
+                if key == b"tokenizer.chat_template":
+                    if vtype != _GGUF_TYPE_STRING:
+                        return None
+                    return _gguf_read_string(f).decode("utf-8", "replace")
+                _gguf_skip_value(f, vtype)
+    except Exception:
+        return None
+    return None
+
 # ── Tool calling ───────────────────────────────────────────────
 # Deliberately a fixed allowlist of typed operations rather than anything
 # resembling a generic "run this command": the catalog ships abliterated
@@ -1183,6 +1241,30 @@ def _tools_enabled():
         return bool(_load_settings_file().get("toolsEnabled", False))
     except Exception:
         return False
+
+def _model_template_handles_tools(model_path):
+    """Whether the model's own chat template can drive tool calling by itself.
+
+    The bar is not "mentions tools" but "asks for the <tool_call> JSON syntax
+    llama-server actually parses back into tool_calls". Three families fail it:
+
+    - No embedded template at all (Huihui-Qwen3-8B).
+    - A stripped ChatML template with no tools block, which abliterated
+      finetunes routinely ship. llama-server then accepts the tools parameter
+      and silently never emits a tool_call.
+    - A template with tool support in a syntax llama-server does not parse.
+      Gemma 4 declares tools in its own DSL and asks for <|tool_call>; measured
+      over the phrasings users actually type ("draw me a picture of ..."), its
+      own template produced 0/3 parsed calls against 3/3 for the bundled ChatML
+      template, which it follows perfectly well.
+
+    Passing this means the model is left on its own template — it is trained on
+    that syntax, so overriding it there would only cost prompt fidelity.
+    """
+    template = _gguf_chat_template(model_path)
+    if not template:
+        return False
+    return "<tool_call>" in template
 
 def _estimate_tokens(text):
     """Rough token count estimate: ~4 chars per token for English text."""
@@ -1443,16 +1525,27 @@ def _start_llama(model_path, job_id=None):
             "--ctx-size", "4096",
             "--n-predict", "-1",
         ]
-        # Tool calling needs --jinja plus a template that actually handles
-        # tools. Abliterated finetunes routinely ship a stripped ChatML
-        # template with no <tools> block, in which case llama-server accepts
-        # the tools parameter and silently never emits a tool_call — so the
-        # bundled template is passed explicitly. Only applied when tool calling
-        # is switched on, since overriding a model's template otherwise risks
+        # Tool calling needs --jinja plus a template that actually produces
+        # tool calls llama-server can parse. Which template that is depends on
+        # the model (see _model_template_handles_tools): one that already asks
+        # for <tool_call> JSON keeps its own, everything else is handed the
+        # bundled ChatML tools template. Only applied when tool calling is
+        # switched on, since overriding a model's template otherwise risks
         # regressing ordinary chat formatting.
-        use_tools = _tools_enabled() and os.path.isfile(TOOL_CHAT_TEMPLATE)
+        tool_template = None
+        use_tools = False
+        if _tools_enabled():
+            if _model_template_handles_tools(model_path):
+                use_tools = True
+            elif os.path.isfile(TOOL_CHAT_TEMPLATE):
+                use_tools = True
+                tool_template = TOOL_CHAT_TEMPLATE
         if use_tools:
-            cmd += ["--jinja", "--chat-template-file", TOOL_CHAT_TEMPLATE]
+            cmd += ["--jinja"]
+            if tool_template:
+                cmd += ["--chat-template-file", tool_template]
+            _log_event(logging.INFO, "Tool calling enabled using %s chat template" % (
+                "the bundled ChatML" if tool_template else "the model's own"))
         else:
             chat_template = _detect_chat_template(model_path)
             if chat_template:
