@@ -809,6 +809,14 @@ _LLAMA_STOP_STRINGS = ()
 # stop strings turns that back into a clean end of turn.
 _CHATML_STOP_STRINGS = ("<|im_end|>", "<|im_start|>")
 
+# Ceiling on a single reply. llama-server runs with --n-predict -1, so without
+# this a model that starts repeating itself generates until the whole context
+# window is full: on a 12B at ~5 tok/s that is thirteen minutes of the UI
+# apparently hanging. Well clear of any ordinary answer — the history
+# truncation below reserves only 500 tokens for a response — so this bounds the
+# failure without touching the normal case.
+MAX_REPLY_TOKENS = 1024
+
 # Track the ollama serve subprocess so we can kill it cleanly
 _OLLAMA_PROC = None
 _OLLAMA_PROC_LOCK = threading.RLock()
@@ -1302,6 +1310,32 @@ def _b64_image_mime(b64):
     if prefix.startswith("UklGR"):
         return "image/webp"
     return "image/jpeg"
+
+def _strip_leaked_markers(text):
+    """Strip transport markers out of an assistant turn before it is replayed.
+
+    A model's own chat template drops its reasoning when it renders history —
+    Gemma 4's does it in a `strip_thinking` macro. Substituting a template for
+    tool calling throws that away, so the markers stay in the saved reply and
+    come straight back as part of the next prompt. The model then reads a
+    transcript in which every assistant turn is full of them, and does the
+    obvious thing: emits more, until there is nothing else left. One request
+    for a picture of a beach produced 12,657 characters of
+    "<|channel>thought<channel|>" that way and ran until the context was full.
+    """
+    if not text:
+        return text
+    s = str(text)
+    s = re.sub(r"<\|channel>[\s\S]*?<channel\|>", "", s)
+    s = re.sub(r"<\|channel>[\s\S]*$", "", s)
+    # Anything past a turn marker is a turn the model invented for itself.
+    s = re.split(r"<\|im_end\|>|<\|im_start\|>", s)[0]
+    # A marker still standing after the paired ones are gone means the turn
+    # degenerated into raw control tokens — the loop drops the opening marker
+    # and repeats the tail, so there is no reply left in there to replay.
+    if "<|channel>" in s or "<channel|>" in s:
+        return ""
+    return s.strip()
 
 def _ollama_msg_to_openai(msg):
     """Convert one Ollama-format message to OpenAI chat format.
@@ -3367,6 +3401,22 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 model_name = ollama_req.get("model", "").lower()
                 raw_messages = ollama_req.get("messages", [])
 
+                # Assistant turns are replayed into the next prompt verbatim,
+                # so a marker left in one is fed back to the model every turn
+                # after (see _strip_leaked_markers).
+                cleaned_messages = []
+                for msg in raw_messages:
+                    if msg.get("role") != "assistant":
+                        cleaned_messages.append(msg)
+                        continue
+                    stripped = _strip_leaked_markers(msg.get("content"))
+                    # A turn that was nothing but markers leaves nothing behind.
+                    # Replaying it as an empty assistant turn would suggest that
+                    # empty replies are the house style, so drop it entirely.
+                    if stripped or msg.get("images"):
+                        cleaned_messages.append(dict(msg, content=stripped))
+                raw_messages = cleaned_messages
+
                 # Models whose chat templates have no system slot — system content
                 # must be folded into the first user message instead.
                 NO_SYSTEM_SLOT_MODELS = ("gemma",)
@@ -3430,7 +3480,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     "model": ollama_req.get("model", "local"),
                     "messages": openai_messages,
                     "stream": True,
-                    "temperature": ollama_req.get("options", {}).get("temperature", 0.7)
+                    "temperature": ollama_req.get("options", {}).get("temperature", 0.7),
+                    "max_tokens": MAX_REPLY_TOKENS,
                 }
                 if _LLAMA_STOP_STRINGS:
                     openai_req["stop"] = list(_LLAMA_STOP_STRINGS)
