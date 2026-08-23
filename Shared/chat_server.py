@@ -3074,18 +3074,46 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 target_url = chat_host + "/v1/chat/completions"
                 body = json.dumps(openai_req).encode()
 
-            req = urllib.request.Request(
-                target_url,
-                data=body,
-                method=method,
-                headers={"Content-Type": self.headers.get("Content-Type", "application/json")}
-            )
+            # Ollama speaks tools natively in its own format — arguments arrive
+            # as an object in one complete frame, which is already the shape the
+            # client expects — so only the request needs enriching, and the
+            # response streams through untouched.
+            tools_injected = False
+            if (active != "llama" and ollama_path == "/api/chat"
+                    and _tools_enabled() and isinstance(payload, dict)):
+                enriched = dict(payload)
+                enriched["tools"] = TOOL_DEFINITIONS
+                body = json.dumps(enriched).encode()
+                tools_injected = True
 
-            # Optional: pass Authorization header if present
-            if "Authorization" in self.headers:
-                req.add_header("Authorization", self.headers.get("Authorization"))
+            def _open(data):
+                r = urllib.request.Request(
+                    target_url,
+                    data=data,
+                    method=method,
+                    headers={"Content-Type": self.headers.get("Content-Type", "application/json")}
+                )
+                # Optional: pass Authorization header if present
+                if "Authorization" in self.headers:
+                    r.add_header("Authorization", self.headers.get("Authorization"))
+                return urllib.request.urlopen(r, timeout=600)
 
-            response = urllib.request.urlopen(req, timeout=600)
+            try:
+                response = _open(body)
+            except urllib.error.HTTPError as e:
+                # Ollama rejects tools outright for models whose template lacks
+                # them ("does not support tools"). Retry once without so that
+                # enabling the toggle degrades to plain chat instead of breaking
+                # it for every model that cannot do tool calls.
+                if tools_injected and e.code == 400:
+                    _log_event(
+                        logging.INFO,
+                        "Model rejected tools; retrying without them",
+                        request_context=request_context,
+                    )
+                    response = _open(json.dumps(payload).encode())
+                else:
+                    raise
 
             # Send response headers
             self.send_response(response.status)

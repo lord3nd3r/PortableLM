@@ -2377,8 +2377,10 @@
               Let the model generate images on request
             </label>
             <span class="sys-hint">
-              llama.cpp only. Changing this restarts the chat engine, since it
-              needs a tool-capable chat template.
+              Works on Ollama right away. On llama.cpp, re-apply the engine
+              afterwards — the tool-capable chat template is chosen when
+              llama-server starts. Models that can't do tool calls simply
+              keep chatting normally.
             </span>
           </div>
         </div>
@@ -4825,8 +4827,8 @@
             S.toolsEnabled = toolsBox.checked;
             toast(
               toolsBox.checked
-                ? 'Tool calling on — re-apply the llama.cpp engine to load it.'
-                : 'Tool calling off — re-apply the engine to unload it.',
+                ? 'Tool calling on. On llama.cpp, re-apply the engine.'
+                : 'Tool calling off.',
             );
           } catch {
             toolsBox.checked = !toolsBox.checked;
