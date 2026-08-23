@@ -1663,6 +1663,11 @@
         background: var(--bgh);
         animation: micPulse 1.2s ease-in-out infinite;
       }
+      /* Hands-free between turns: mic closed, conversation still running. */
+      #mic-btn.hf {
+        color: var(--grad1);
+        background: var(--bgh);
+      }
       #mic-btn:disabled {
         opacity: 0.6;
         cursor: default;
@@ -2414,6 +2419,18 @@
           </div>
           <hr class="sys-divider" />
         </div>
+        <!-- Hidden until the server reports a whisper model and the browser
+             actually exposes a microphone (see loadSttCapability). -->
+        <div class="sys-row" id="handsfree-row" style="display:none">
+          <label for="hands-free">Hands-free voice</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+            <label class="sys-hint" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="hands-free" /> Send when I stop talking, then listen again after the reply
+            </label>
+            <span class="sys-hint">Tap the mic once to start the conversation, again to end it. Pairs with "Speak replies automatically".</span>
+          </div>
+        </div>
+        <hr class="sys-divider" />
         <div class="sys-row">
           <label for="log-mode-select">Logging</label>
           <div class="sys-subrow">
@@ -2838,6 +2855,7 @@
       ttsVoice: localStorage.getItem('ttsVoice') || '',
       ttsRate: parseFloat(localStorage.getItem('ttsRate')) || 1.0,
       ttsAuto: localStorage.getItem('ttsAuto') === '1',
+      handsFree: localStorage.getItem('handsFree') === '1',
 
       // Speech to text (discovered from the server at startup)
       sttEnabled: false,
@@ -3992,6 +4010,9 @@
           // a stopped or errored one, which would announce a stale answer.
           if (S.ttsAuto && S.ttsEnabled && aiMsg.content && conv.msgs.includes(aiMsg)) {
             speakText(aiMsg.content, aiMsg.id);
+          } else {
+            // Nothing to wait for — a silent reply hands the turn straight back.
+            handsFreeListenAgain();
           }
         }
       }
@@ -4350,16 +4371,24 @@
           S.sttEnabled = false;
         }
         const btn = document.getElementById('mic-btn');
+        const usable = S.sttEnabled && MIC_AVAILABLE;
         if (btn) {
           // Needs both the server engine and a secure browser context.
-          btn.style.display = S.sttEnabled && MIC_AVAILABLE ? 'flex' : 'none';
+          btn.style.display = usable ? 'flex' : 'none';
         }
+        const hfRow = document.getElementById('handsfree-row');
+        if (hfRow) hfRow.style.display = usable ? '' : 'none';
+        const hfBox = document.getElementById('hands-free');
+        if (hfBox) hfBox.checked = S.handsFree;
       }
 
       let micRecorder = null;
       let micChunks = [];
       let micStream = null;
       let micBusy = false;
+      let micVadStop = null;    // tears down the level meter for the open take
+      let micEndReason = 'manual';  // 'manual' | 'silence' | 'idle'
+      let hfActive = false;     // a hands-free conversation is running
 
       // whisper.cpp decodes WAV only — it rejects the webm/opus that
       // MediaRecorder produces — so convert in the browser. decodeAudioData
@@ -4413,26 +4442,122 @@
         return encodeWav16(rendered.getChannelData(0), rate);
       }
 
+      // Silence detection. Metering RMS off an AnalyserNode is enough to tell
+      // talking from room tone without shipping a real VAD model, and it reads
+      // the live stream rather than the encoded chunks, so it costs nothing on
+      // top of the recording already happening.
+      const VAD_TICK_MS = 50;
+      const VAD_SILENCE_MS = 1500;   // quiet that means "the sentence is over"
+      const VAD_NO_SPEECH_MS = 8000; // opened the mic and said nothing at all
+      const VAD_MAX_MS = 120000;     // hard cap, so a stuck mic can't run forever
+
+      // Returns a teardown function, or null when the browser has no WebAudio
+      // to meter with (in which case the take can still be ended by hand).
+      function startVad(stream, onSilence, onNoSpeech) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        let ctx;
+        try {
+          ctx = new AC();
+        } catch {
+          return null;
+        }
+        const src = ctx.createMediaStreamSource(stream);
+        const an = ctx.createAnalyser();
+        an.fftSize = 1024;
+        src.connect(an);
+        const buf = new Float32Array(an.fftSize);
+        const startedAt = Date.now();
+        let timer = null;
+        let floor = null;
+        let lastLoud = 0;
+        let spoke = false;
+
+        function teardown() {
+          if (timer !== null) clearInterval(timer);
+          timer = null;
+          try {
+            src.disconnect();
+          } catch {}
+          try {
+            ctx.close();
+          } catch {}
+        }
+
+        function tick() {
+          an.getFloatTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+          const rms = Math.sqrt(sum / buf.length);
+          // The gate floats with the room: it drops to any quieter level at
+          // once and creeps back up slowly, so a fan or a noisy street raises
+          // the bar within a second or two while a spoken sentence never does.
+          floor = floor === null ? rms : rms < floor ? rms : floor * 0.995 + rms * 0.005;
+          const gate = Math.max(0.012, floor * 3);
+          const now = Date.now();
+          if (rms > gate) {
+            spoke = true;
+            lastLoud = now;
+          }
+          if (spoke && now - lastLoud > VAD_SILENCE_MS) {
+            teardown();
+            onSilence();
+          } else if (!spoke && now - startedAt > VAD_NO_SPEECH_MS) {
+            teardown();
+            onNoSpeech();
+          } else if (now - startedAt > VAD_MAX_MS) {
+            teardown();
+            onSilence();
+          }
+        }
+
+        timer = setInterval(tick, VAD_TICK_MS);
+        return teardown;
+      }
+
+      function endHandsFree(msg) {
+        if (!hfActive) return;
+        hfActive = false;
+        if (msg) toast(msg);
+        setMicState(micRecorder ? 'recording' : 'idle');
+      }
+
+      // Reopen the mic for the next turn: called when the reply has been read
+      // out, or as soon as the stream ends if nothing is being spoken.
+      function handsFreeListenAgain() {
+        if (!hfActive || micRecorder || micBusy || S.streaming) return;
+        startDictation(true);
+      }
+
       function setMicState(state) {
         const btn = document.getElementById('mic-btn');
         if (!btn) return;
         btn.classList.toggle('rec', state === 'recording');
+        // Between turns the mic is closed but the conversation is still live,
+        // so the button stays lit rather than going grey like plain dictation.
+        btn.classList.toggle('hf', hfActive && state !== 'recording');
         btn.disabled = state === 'busy';
         btn.innerHTML =
           state === 'recording'
             ? '<i class="fa-solid fa-stop"></i>'
             : state === 'busy'
               ? '<i class="fa-solid fa-spinner fa-spin"></i>'
-              : '<i class="fa-solid fa-microphone"></i>';
-        btn.title =
-          state === 'recording' ? 'Stop and transcribe' : 'Dictate message';
+              : hfActive
+                ? '<i class="fa-solid fa-comment-dots"></i>'
+                : '<i class="fa-solid fa-microphone"></i>';
+        btn.title = hfActive
+          ? 'End hands-free conversation'
+          : state === 'recording'
+            ? 'Stop and transcribe'
+            : 'Dictate message';
       }
 
-      async function startDictation() {
+      async function startDictation(handsFree) {
         if (micBusy || micRecorder) return;
         try {
           micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         } catch {
+          endHandsFree();
           toast('Microphone permission denied.');
           return;
         }
@@ -4440,6 +4565,7 @@
         try {
           micRecorder = new MediaRecorder(micStream);
         } catch {
+          endHandsFree();
           toast('Recording is not supported in this browser.');
           stopMicStream();
           return;
@@ -4448,10 +4574,27 @@
           if (e.data && e.data.size) micChunks.push(e.data);
         };
         micRecorder.onstop = () => finishDictation();
+        micEndReason = 'manual';
         micRecorder.start();
         setMicState('recording');
         // Speaking and listening at once would transcribe our own voice.
         stopSpeaking();
+        if (handsFree) {
+          micVadStop = startVad(
+            micStream,
+            () => {
+              micEndReason = 'silence';
+              stopDictation();
+            },
+            () => {
+              micEndReason = 'idle';
+              stopDictation();
+            },
+          );
+          if (!micVadStop) {
+            endHandsFree("This browser can't tell when you stop talking.");
+          }
+        }
       }
 
       function stopMicStream() {
@@ -4466,16 +4609,36 @@
       }
 
       async function finishDictation() {
+        const reason = micEndReason;
+        micEndReason = 'manual';
+        if (micVadStop) {
+          micVadStop();
+          micVadStop = null;
+        }
         const chunks = micChunks;
         micChunks = [];
         micRecorder = null;
         stopMicStream();
         if (!chunks.length) {
+          endHandsFree();
+          setMicState('idle');
+          return;
+        }
+        // The mic was open but nothing was ever said. Transcribing room tone
+        // only produces whisper's hallucinated filler, so drop the take and
+        // stand down rather than listening at an empty room forever.
+        if (reason === 'idle') {
+          endHandsFree('Stopped listening.');
           setMicState('idle');
           return;
         }
         micBusy = true;
         setMicState('busy');
+        // Filled in instead of sending inline: sendMsg has to run after the
+        // finally below, or handsFreeListenAgain would see micBusy still set
+        // and quietly drop the conversation.
+        let pendingSend = null;
+        let listenAgain = false;
         try {
           const wav = await blobToWav16k(new Blob(chunks));
           const r = await fetch('/api/stt', {
@@ -4485,27 +4648,58 @@
           });
           const d = await r.json();
           if (!r.ok) {
+            endHandsFree();
             toast(d.error || 'Transcription failed.');
           } else if (!d.text) {
             toast("Didn't catch that.");
+            // Heard something, understood nothing: one bad take shouldn't end
+            // the conversation.
+            listenAgain = hfActive;
           } else {
             // Append rather than replace, so dictation can extend typed text.
             const cur = D.inp.value.trim();
             D.inp.value = cur ? cur + ' ' + d.text : d.text;
             D.inp.dispatchEvent(new Event('input')); // resize + enable send
-            D.inp.focus();
+            // Hands-free only sends a take that silence ended. A take the user
+            // stopped by hand lands in the box for them to check first.
+            if (hfActive && reason === 'silence') pendingSend = D.inp.value;
+            else D.inp.focus();
           }
         } catch {
+          endHandsFree();
           toast('Could not process the recording.');
         } finally {
           micBusy = false;
           setMicState('idle');
         }
+        if (pendingSend !== null) sendMsg(pendingSend);
+        else if (listenAgain) handsFreeListenAgain();
       }
 
       function toggleDictation() {
-        if (micRecorder) stopDictation();
-        else startDictation();
+        // With a take open the button is a stop button. In hands-free that also
+        // ends the conversation — what was said still lands in the input box,
+        // it just isn't sent for you.
+        if (micRecorder) {
+          const wasHandsFree = hfActive;
+          hfActive = false;
+          stopDictation();
+          if (wasHandsFree) toast('Hands-free off.');
+          return;
+        }
+        // Between turns there is no take to stop, so the button ends the loop
+        // and shuts up whatever is being read out.
+        if (hfActive) {
+          endHandsFree('Hands-free off.');
+          stopSpeaking();
+          return;
+        }
+        if (S.handsFree) {
+          hfActive = true;
+          startDictation(true);
+          return;
+        }
+        startDictation(false);
       }
 
       // ── Text to speech ───────────────────────────────────────
@@ -4709,6 +4903,7 @@
             } catch {}
             stopSpeaking();
             toast(msg);
+            handsFreeListenAgain();
             return;
           }
           const blob = await r.blob();
@@ -4716,13 +4911,21 @@
           if (ttsSpeakingId !== (id || null)) return;
           const a = new Audio(URL.createObjectURL(blob));
           ttsAudio = a;
-          a.onended = () => stopSpeaking();
-          a.onerror = () => stopSpeaking();
+          // The end of the spoken reply is the cue to listen for the next turn.
+          a.onended = () => {
+            stopSpeaking();
+            handsFreeListenAgain();
+          };
+          a.onerror = () => {
+            stopSpeaking();
+            handsFreeListenAgain();
+          };
           await a.play();
         } catch (e) {
           if (e.name !== 'AbortError') {
             stopSpeaking();
             toast('Speech failed.');
+            handsFreeListenAgain();
           }
         }
       }
@@ -4994,6 +5197,20 @@
           S.ttsAuto = ttsAutoBox.checked;
           localStorage.setItem('ttsAuto', S.ttsAuto ? '1' : '0');
           if (!S.ttsAuto) stopSpeaking();
+        });
+      }
+      const handsFreeBox = document.getElementById('hands-free');
+      if (handsFreeBox) {
+        handsFreeBox.addEventListener('change', () => {
+          S.handsFree = handsFreeBox.checked;
+          localStorage.setItem('handsFree', S.handsFree ? '1' : '0');
+          // Switching it off mid-conversation stops the loop rather than
+          // waiting for the current turn to come round again.
+          if (!S.handsFree && hfActive) {
+            hfActive = false;
+            stopDictation();
+            setMicState(micRecorder ? 'recording' : 'idle');
+          }
         });
       }
       const voiceCat = document.getElementById('voice-catalog');

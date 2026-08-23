@@ -153,6 +153,13 @@ appears in the message bar — click to record, click to stop, and the transcrip
 appended to whatever you've already typed. Transcription runs at roughly 3x realtime on
 CPU.
 
+Switch on **Hands-free voice** in settings and it stops being push-to-talk: tap the mic
+once and PortableLM listens, notices when you stop talking, sends what you said, reads
+the reply aloud and opens the mic again for your next turn. Tap the mic to end the
+conversation — anything already said stays in the message box unsent, so a misheard
+sentence is never sent behind your back. It stands down on its own if you open the mic
+and say nothing.
+
 > **Two limits worth knowing.** Browsers only expose the microphone in a *secure
 > context*, so dictation works on the machine running the server (`localhost` counts) but
 > **not from your phone over plain `http://` on the LAN** — the button is hidden there
