@@ -969,6 +969,10 @@ def _load_settings_file():
         "logMode": DEFAULT_LOG_MODE,
         "chatEngine": "ollama",
         "llamaModel": "",
+        # MoE expert offload for the llama.cpp engine. "auto" is the default
+        # and only changes the launch on a discrete GPU with an MoE GGUF.
+        "llamaMoeOffload": "auto",
+        "llamaMoeOffloadLayers": 28,
     }
     try:
         with DATA_FILE_LOCK:
@@ -978,6 +982,7 @@ def _load_settings_file():
             merged = dict(default_settings)
             merged.update(loaded)
             merged["logMode"] = _normalize_log_mode(merged.get("logMode"))
+            _normalize_moe_settings(merged)
             return merged
     except Exception:
         pass
@@ -1227,6 +1232,562 @@ def _gguf_chat_template(model_path):
     except Exception:
         return None
     return None
+
+# ── MoE expert offload (llama.cpp) ─────────────────────────────
+# The installers pin llama-server b9444. In that build --fit defaults to on
+# and, for a mixture-of-experts model, keeps dense tensors (attention, shared
+# weights) and the KV cache on the GPU, moving only the expert tensors that
+# do not fit into system RAM. Passing -ngl / --gpu-layers or --n-cpu-moe
+# marks those settings as user-owned, and fit then refuses to run
+# (common/fit.cpp; upstream issue 27872). Auto therefore passes --fit on and
+# nothing else. Manual is the article recipe: every layer on the GPU, the
+# first N layers of experts in system RAM, fit explicitly off.
+#
+# n_gpu_layers < 0 means "all layers" (llama_model::n_gpu_layers). --fit off
+# leaves that default in place, so Off does not drop GPU offload; it only
+# stops the fitter from spilling experts.
+MOE_OFFLOAD_AUTO = "auto"
+MOE_OFFLOAD_OFF = "off"
+MOE_OFFLOAD_MANUAL = "manual"
+MOE_OFFLOAD_MODES = (MOE_OFFLOAD_AUTO, MOE_OFFLOAD_OFF, MOE_OFFLOAD_MANUAL)
+MOE_OFFLOAD_LAYERS_DEFAULT = 28
+MOE_OFFLOAD_LAYERS_MAX = 256
+# Headroom for the pinned 4096-token KV cache and the compute buffer when
+# --fit is missing and the only signal left is file size versus free VRAM.
+_MOE_VRAM_MARGIN_BYTES = 1024 ** 3
+_MOE_VRAM_HEADROOM = 0.90
+_GGUF_INT_TYPES = {0, 1, 2, 3, 4, 5, 10, 11}
+# Filename fallback for GGUFs that omit expert_count. "A3B" / "A22B" is the
+# active-parameter mark used by Qwen MoE quants; gpt-oss and mixtral are MoE
+# families whose names do not contain "moe".
+_MOE_NAME_RE = re.compile(
+    r"(?:(?:^|[^a-z0-9])moe(?:[^a-z0-9]|$)|mixtral|gpt-oss|[-_.]a\d+b(?:[^a-z0-9]|$))",
+    re.IGNORECASE,
+)
+# Marketing names, not backend prefixes. "Radeon Graphics" is an APU;
+# "Radeon RX" / "GeForce" / "Arc A770" are discrete cards.
+_DISCRETE_DEVICE_RE = re.compile(
+    r"(?i)(?:\b(?:CUDA|ROCm|HIP)\d*\s*:|\b(?:RTX|GTX|Quadro|Tesla|GeForce)\b"
+    r"|\bRadeon\s+(?:RX|Pro)\b|\bArc\b.{0,12}\b[AB]\d{2,4}\b)"
+)
+_INTEGRATED_DEVICE_RE = re.compile(
+    r"(?i)\b(?:UHD|Iris|Radeon\s+Graphics|Intel\(R\)\s+(?:HD|UHD)|Vega\s+\d+)\b"
+)
+_GPU_PROBE = {"done": False, "discrete": False, "vram_bytes": None}
+_GPU_PROBE_LOCK = threading.Lock()
+_LLAMA_CAPS_CACHE = {}
+
+def _normalize_moe_offload_mode(value):
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in MOE_OFFLOAD_MODES:
+            return mode
+    return MOE_OFFLOAD_AUTO
+
+def _normalize_moe_offload_layers(value):
+    if value is None or value == "":
+        return MOE_OFFLOAD_LAYERS_DEFAULT
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return MOE_OFFLOAD_LAYERS_DEFAULT
+    if n < 0:
+        return 0
+    if n > MOE_OFFLOAD_LAYERS_MAX:
+        return MOE_OFFLOAD_LAYERS_MAX
+    return n
+
+def _normalize_moe_settings(settings):
+    settings["llamaMoeOffload"] = _normalize_moe_offload_mode(settings.get("llamaMoeOffload"))
+    settings["llamaMoeOffloadLayers"] = _normalize_moe_offload_layers(settings.get("llamaMoeOffloadLayers"))
+    return settings
+
+def _filename_looks_like_moe(model_path):
+    return _MOE_NAME_RE.search(os.path.basename(model_path or "")) is not None
+
+def _gguf_read_int(f, vtype):
+    sizes = {
+        0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+        4: ("<I", 4), 5: ("<i", 4), 10: ("<Q", 8), 11: ("<q", 8),
+    }
+    fmt, size = sizes[vtype]
+    data = f.read(size)
+    if len(data) != size:
+        raise ValueError("truncated gguf integer")
+    return struct.unpack(fmt, data)[0]
+
+def _gguf_read_short_string(f, limit):
+    length, = struct.unpack("<Q", f.read(8))
+    if length > limit:
+        raise ValueError("gguf string longer than %s bytes" % limit)
+    data = f.read(length)
+    if len(data) != length:
+        raise ValueError("truncated gguf string")
+    return data
+
+def _gguf_moe_metadata(model_path):
+    """Read architecture / expert_count / block_count from a GGUF header.
+
+    Missing keys are None. A non-GGUF or truncated file yields all Nones.
+    Hparams are emitted before the tokenizer, so the scan stops at the first
+    tokenizer key once block_count for the architecture is in hand — that
+    skips the token-list array, which is the slow part of the header.
+    """
+    found = {
+        "architecture": None,
+        "expert_count": None,
+        "expert_used_count": None,
+        "block_count": None,
+    }
+    counts = {}
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return found
+            version, = struct.unpack("<I", f.read(4))
+            if version not in (2, 3):
+                return found
+            _tensor_count, kv_count = struct.unpack("<QQ", f.read(16))
+            if kv_count > 1000000:
+                return found
+            for _ in range(kv_count):
+                key = _gguf_read_short_string(f, 4096).decode("utf-8", "replace")
+                vtype, = struct.unpack("<I", f.read(4))
+                if key == "general.architecture" and vtype == _GGUF_TYPE_STRING:
+                    found["architecture"] = _gguf_read_short_string(f, 256).decode("utf-8", "replace")
+                elif (
+                    key.endswith(".expert_count")
+                    or key.endswith(".expert_used_count")
+                    or key.endswith(".block_count")
+                ) and vtype in _GGUF_INT_TYPES:
+                    counts[key] = _gguf_read_int(f, vtype)
+                elif (
+                    found["architecture"]
+                    and ("%s.block_count" % found["architecture"]) in counts
+                    and key.startswith("tokenizer.")
+                ):
+                    break
+                else:
+                    _gguf_skip_value(f, vtype)
+    except Exception:
+        pass
+
+    arch = found["architecture"]
+
+    def pick(suffix):
+        if arch:
+            specific = counts.get("%s.%s" % (arch, suffix))
+            if specific is not None:
+                return specific
+        for full_key, value in counts.items():
+            if full_key.endswith("." + suffix):
+                return value
+        return None
+
+    found["expert_count"] = pick("expert_count")
+    found["expert_used_count"] = pick("expert_used_count")
+    found["block_count"] = pick("block_count")
+    return found
+
+def _moe_model_facts(model_path, metadata=None):
+    """Whether this file is an MoE model, and the counts the flags need."""
+    meta = metadata if metadata is not None else _gguf_moe_metadata(model_path)
+    expert_count = meta.get("expert_count")
+    expert_used = meta.get("expert_used_count")
+    source = "metadata"
+    if expert_count is not None:
+        is_moe = int(expert_count) > 1
+    elif expert_used is not None and int(expert_used) > 1:
+        is_moe = True
+    elif _filename_looks_like_moe(model_path):
+        is_moe = True
+        source = "filename"
+    else:
+        is_moe = False
+    return {
+        "is_moe": is_moe,
+        "source": source,
+        "architecture": meta.get("architecture"),
+        "expert_count": expert_count,
+        "expert_used_count": expert_used,
+        "block_count": meta.get("block_count"),
+    }
+
+def _moe_context_phrase(facts, discrete_gpu):
+    bits = []
+    if facts.get("architecture"):
+        bits.append(str(facts["architecture"]))
+    if facts.get("expert_count") is not None:
+        bits.append("%s experts" % facts["expert_count"])
+    elif facts.get("expert_used_count") is not None:
+        bits.append("%s experts used" % facts["expert_used_count"])
+    if facts.get("block_count") is not None:
+        bits.append("%s layers" % facts["block_count"])
+    bits.append("via %s" % facts.get("source", "metadata"))
+    bits.append("discrete GPU" if discrete_gpu else "no discrete GPU")
+    return ", ".join(bits)
+
+def _moe_file_exceeds_vram(file_bytes, vram_bytes):
+    """True / False when both sizes are known, None when they are not.
+
+    None means "do not change the launch": an offload guess without a VRAM
+    figure can make a model that already fits slower.
+    """
+    if not file_bytes or not vram_bytes or vram_bytes <= 0:
+        return None
+    return file_bytes + _MOE_VRAM_MARGIN_BYTES > int(vram_bytes * _MOE_VRAM_HEADROOM)
+
+def _manual_moe_flags(layers, block_count, capabilities):
+    """Flags for keeping `layers` of expert tensors in system RAM.
+
+    --gpu-layers 999 puts every layer on the GPU (b9444 caps the value at the
+    real layer count; 99 would leave the tail of a 100-layer model on the CPU).
+    --fit off is required alongside it: with expert overrides already set, the
+    fitter aborts and the following allocation can OOM.
+    """
+    caps = capabilities or {}
+    use_all = block_count is not None and block_count > 0 and layers >= block_count
+    if use_all and caps.get("cpu_moe"):
+        moe = ["--cpu-moe"]
+        note = "--cpu-moe because N=%s covers all %s layers" % (layers, block_count)
+    elif caps.get("n_cpu_moe"):
+        n = block_count if use_all and block_count else layers
+        moe = ["--n-cpu-moe", str(n)]
+        note = "--n-cpu-moe %s" % n
+    elif caps.get("cpu_moe"):
+        moe = ["--cpu-moe"]
+        note = "--cpu-moe (this llama-server cannot offload a prefix of layers)"
+    else:
+        return [], ""
+    flags = []
+    if caps.get("fit"):
+        flags += ["--fit", "off"]
+    gpu_flag = caps.get("gpu_layers_flag")
+    if gpu_flag:
+        flags += [gpu_flag, "999"]
+    flags += moe
+    return flags, note
+
+def _llama_moe_offload_args(facts, settings, discrete_gpu, capabilities, vram_bytes=None, file_bytes=None):
+    """Extra llama-server arguments for the MoE offload setting.
+
+    Dense models and hosts without a discrete GPU get an empty list in every
+    mode, which is the launch this server used before the setting existed.
+    `facts` is the dict from _moe_model_facts.
+    """
+    settings = settings or {}
+    caps = capabilities or {}
+    mode = _normalize_moe_offload_mode(settings.get("llamaMoeOffload"))
+    layers = _normalize_moe_offload_layers(settings.get("llamaMoeOffloadLayers"))
+    where = _moe_context_phrase(facts or {}, discrete_gpu)
+
+    if not (facts or {}).get("is_moe"):
+        return [], "%s; dense model, launch flags unchanged" % where
+    if not discrete_gpu:
+        return [], "%s; CPU, integrated GPU, Apple Metal, or Termux, launch flags unchanged" % where
+
+    if mode == MOE_OFFLOAD_OFF or (mode == MOE_OFFLOAD_MANUAL and layers <= 0):
+        if caps.get("fit"):
+            label = "off" if mode == MOE_OFFLOAD_OFF else "manual N=0"
+            return ["--fit", "off"], "%s; %s, --fit off so expert tensors stay on the GPU" % (where, label)
+        return [], "%s; expert offload disabled in settings but this llama-server has no --fit flag, launch flags unchanged" % where
+
+    if mode == MOE_OFFLOAD_MANUAL:
+        flags, note = _manual_moe_flags(layers, (facts or {}).get("block_count"), caps)
+        if not flags:
+            return [], "%s; manual N=%s but this llama-server has no MoE offload flag, launch flags unchanged" % (where, layers)
+        return flags, "%s; manual, %s, every layer on the GPU" % (where, note)
+
+    if caps.get("fit"):
+        return ["--fit", "on"], (
+            "%s; --fit on so llama-server keeps attention, shared weights, and the KV cache "
+            "on the GPU and moves expert tensors that do not fit into system RAM. "
+            "-ngl and --n-cpu-moe are left unset because setting them disables --fit"
+        ) % where
+
+    exceeds = _moe_file_exceeds_vram(file_bytes, vram_bytes)
+    if exceeds is not True:
+        if exceeds is False:
+            return [], "%s; model file fits in free VRAM and llama-server has no --fit, launch flags unchanged" % where
+        return [], "%s; llama-server has no --fit and free VRAM is unknown, launch flags unchanged" % where
+    block_count = (facts or {}).get("block_count")
+    layers_all = block_count if block_count else MOE_OFFLOAD_LAYERS_MAX
+    flags, note = _manual_moe_flags(layers_all, block_count, caps)
+    if not flags:
+        return [], "%s; model file is larger than free VRAM but this llama-server has no MoE offload flag, launch flags unchanged" % where
+    return flags, "%s; model file is larger than free VRAM and llama-server has no --fit, %s" % (where, note)
+
+def _llama_binary_env(binary):
+    """Environment for a bundled llama-server. Linux needs its lib directory."""
+    env = os.environ.copy()
+    if binary and platform.system() == "Linux":
+        bin_dir = os.path.dirname(os.path.abspath(binary))
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = bin_dir + (":" + existing if existing else "")
+    return env
+
+def _run_quiet(cmd, timeout, env=None):
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return None, "", ""
+    return result.returncode, result.stdout or "", result.stderr or ""
+
+def _help_has_flag(text, flag):
+    # "--cpu-moe" is not a match inside "--n-cpu-moe", and "--fit" is not a
+    # match inside "--fit-target".
+    return re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", text or "") is not None
+
+def _llama_server_capabilities(binary):
+    """Which MoE flags this llama-server binary accepts.
+
+    A missing binary or a --help that does not answer yields every flag
+    unsupported, so the launch stays as it was. b9444's own default --fit
+    still runs in that case; we just do not pass a flag we could not see.
+    """
+    unsupported = {
+        "fit": False,
+        "n_cpu_moe": False,
+        "cpu_moe": False,
+        "gpu_layers_flag": None,
+        "probed": False,
+    }
+    if not binary or not os.path.isfile(binary):
+        return dict(unsupported)
+    try:
+        stamp = os.path.getmtime(binary)
+    except OSError:
+        stamp = None
+    key = (os.path.abspath(binary), stamp)
+    cached = _LLAMA_CAPS_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    caps = dict(unsupported)
+    try:
+        _code, stdout, stderr = _run_quiet([binary, "--help"], 20, env=_llama_binary_env(binary))
+        text = stdout + "\n" + stderr
+        if "--" in text:
+            if _help_has_flag(text, "--gpu-layers"):
+                gpu_flag = "--gpu-layers"
+            elif _help_has_flag(text, "--n-gpu-layers"):
+                gpu_flag = "--n-gpu-layers"
+            elif _help_has_flag(text, "-ngl"):
+                gpu_flag = "-ngl"
+            else:
+                gpu_flag = None
+            caps = {
+                "fit": _help_has_flag(text, "--fit"),
+                "n_cpu_moe": _help_has_flag(text, "--n-cpu-moe"),
+                "cpu_moe": _help_has_flag(text, "--cpu-moe"),
+                "gpu_layers_flag": gpu_flag,
+                "probed": True,
+            }
+    except Exception:
+        caps = dict(unsupported)
+    _LLAMA_CAPS_CACHE[key] = dict(caps)
+    return dict(caps)
+
+def _line_is_discrete_device(line):
+    """True for a llama-server --list-devices line that names a discrete GPU."""
+    if not line or ":" not in line:
+        return False
+    if _INTEGRATED_DEVICE_RE.search(line) and not re.search(
+        r"(?i)\b(?:RTX|GTX|Quadro|Tesla|Radeon\s+RX)\b", line
+    ):
+        return False
+    return _DISCRETE_DEVICE_RE.search(line) is not None
+
+def _device_list_lines(text):
+    lines = []
+    started = False
+    for line in (text or "").splitlines():
+        if "Available devices" in line:
+            started = True
+            continue
+        if not started:
+            continue
+        stripped = line.strip()
+        if stripped and ":" in stripped:
+            lines.append(stripped)
+    return lines
+
+def _vram_bytes_from_device_lines(lines):
+    total = 0
+    found = False
+    for line in lines:
+        if not _line_is_discrete_device(line):
+            continue
+        match = re.search(r"\((\d+)\s*MiB,\s*(\d+)\s*MiB\s*free\)", line)
+        if not match:
+            continue
+        free_mib = int(match.group(2))
+        if free_mib > 0:
+            total += free_mib * 1024 * 1024
+            found = True
+    return total if found else None
+
+def _nvidia_smi_commands(args):
+    commands = [["nvidia-smi"] + list(args)]
+    if platform.system() == "Windows":
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        commands.append([os.path.join(root, "System32", "nvidia-smi.exe")] + list(args))
+    return commands
+
+def _nvidia_gpu_listed():
+    for cmd in _nvidia_smi_commands(["-L"]):
+        code, stdout, stderr = _run_quiet(cmd, 8)
+        if code == 0 and re.search(r"GPU\s+\d+", stdout + "\n" + stderr):
+            return True
+    if platform.system() == "Linux":
+        proc = "/proc/driver/nvidia/gpus"
+        try:
+            if os.path.isdir(proc) and any(os.scandir(proc)):
+                return True
+        except OSError:
+            pass
+    return False
+
+def _nvidia_free_vram_bytes():
+    for cmd in _nvidia_smi_commands(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]):
+        code, stdout, _stderr = _run_quiet(cmd, 8)
+        if code != 0:
+            continue
+        total = 0
+        found = False
+        for line in stdout.splitlines():
+            token = line.strip().split()[0].replace(",", "") if line.strip() else ""
+            if not token or not token[0].isdigit():
+                continue
+            try:
+                mib = int(float(token))
+            except ValueError:
+                continue
+            if mib > 0:
+                total += mib * 1024 * 1024
+                found = True
+        if found:
+            return total
+    return None
+
+def _rocm_gpu_listed():
+    code, stdout, stderr = _run_quiet(["rocm-smi", "-i"], 8)
+    if code != 0:
+        return False
+    text = stdout + "\n" + stderr
+    return bool(re.search(r"(?i)\bGPU\b|Device ID|card\d", text))
+
+def _vulkan_summary_has_discrete(text):
+    return bool(re.search(r"DISCRETE_GPU", text or ""))
+
+def _vulkan_has_discrete_gpu():
+    for cmd in (["vulkaninfo", "--summary"], ["vulkaninfo.exe", "--summary"]):
+        code, stdout, stderr = _run_quiet(cmd, 12)
+        text = stdout + "\n" + stderr
+        if code is None and not text.strip():
+            continue
+        if text.strip():
+            return _vulkan_summary_has_discrete(text)
+    return False
+
+def _llama_list_devices_output(binary):
+    """Return (stdout, ok). ok means the binary printed its device list."""
+    if not binary or not os.path.isfile(binary):
+        return "", False
+    _code, stdout, _stderr = _run_quiet(
+        [binary, "--list-devices"], 20, env=_llama_binary_env(binary)
+    )
+    if "Available devices" in stdout:
+        return stdout, True
+    return "", False
+
+def _probe_gpu_once():
+    """Cache whether *this* llama-server can see a discrete GPU, and its free VRAM.
+
+    Apple Metal and Termux return immediately: unified memory and the phone
+    build are left on today's launch flags. When the binary answers
+    --list-devices, that answer wins over nvidia-smi, so a CPU build installed
+    on a machine that also has a GPU does not grow GPU flags.
+    """
+    if _GPU_PROBE["done"]:
+        return
+    with _GPU_PROBE_LOCK:
+        if _GPU_PROBE["done"]:
+            return
+        _GPU_PROBE["discrete"] = False
+        _GPU_PROBE["vram_bytes"] = None
+        try:
+            if os.environ.get("TERMUX_VERSION") or os.path.isdir("/data/data/com.termux"):
+                return
+            if platform.system() == "Darwin":
+                return
+            text, ok = _llama_list_devices_output(LLAMA_BIN)
+            if ok:
+                lines = _device_list_lines(text)
+                if any(_line_is_discrete_device(line) for line in lines):
+                    _GPU_PROBE["discrete"] = True
+                    vram = _vram_bytes_from_device_lines(lines)
+                    _GPU_PROBE["vram_bytes"] = vram or _nvidia_free_vram_bytes()
+                return
+            if _nvidia_gpu_listed() or _rocm_gpu_listed() or _vulkan_has_discrete_gpu():
+                _GPU_PROBE["discrete"] = True
+                _GPU_PROBE["vram_bytes"] = _nvidia_free_vram_bytes()
+        except Exception:
+            _GPU_PROBE["discrete"] = False
+            _GPU_PROBE["vram_bytes"] = None
+        finally:
+            _GPU_PROBE["done"] = True
+
+def _discrete_gpu_present():
+    _probe_gpu_once()
+    return bool(_GPU_PROBE["discrete"])
+
+def _query_discrete_vram_bytes():
+    _probe_gpu_once()
+    return _GPU_PROBE.get("vram_bytes")
+
+def _llama_moe_offload_plan(model_path, settings=None, discrete_gpu=None, capabilities=None,
+                            vram_bytes=None, file_bytes=None, metadata=None):
+    """Resolve the MoE setting, the model, and the host into llama-server flags.
+
+    Pass discrete_gpu / capabilities / vram_bytes to skip the live probes
+    (tests, and any caller that already knows).
+    """
+    if settings is None:
+        settings = _load_settings_file()
+    if capabilities is None:
+        capabilities = _llama_server_capabilities(LLAMA_BIN)
+    if discrete_gpu is None:
+        discrete_gpu = _discrete_gpu_present()
+    facts = _moe_model_facts(model_path, metadata)
+    if file_bytes is None and model_path and os.path.isfile(model_path):
+        try:
+            file_bytes = os.path.getsize(model_path)
+        except OSError:
+            file_bytes = None
+    if (
+        vram_bytes is None
+        and facts["is_moe"]
+        and discrete_gpu
+        and not (capabilities or {}).get("fit")
+        and _normalize_moe_offload_mode(settings.get("llamaMoeOffload")) == MOE_OFFLOAD_AUTO
+    ):
+        vram_bytes = _query_discrete_vram_bytes()
+    return _llama_moe_offload_args(
+        facts,
+        settings,
+        discrete_gpu,
+        capabilities or {},
+        vram_bytes=vram_bytes,
+        file_bytes=file_bytes,
+    )
 
 # ── Tool calling ───────────────────────────────────────────────
 # Deliberately a fixed allowlist of typed operations rather than anything
@@ -1560,12 +2121,7 @@ def _start_llama(model_path, job_id=None):
         if job_id:
             _update_engine_startup_job(job_id, phase="loading_model", message="Loading model...", progress_pct=5)
         
-        bin_dir = os.path.dirname(os.path.abspath(LLAMA_BIN))
-        env = os.environ.copy()
-        # Add binary dir to library path for bundled .so/.dll files
-        if platform.system() == "Linux":
-            existing = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = bin_dir + (":" + existing if existing else "")
+        env = _llama_binary_env(LLAMA_BIN)
         cmd = [
             LLAMA_BIN,
             "--model", model_path,
@@ -1574,6 +2130,20 @@ def _start_llama(model_path, job_id=None):
             "--ctx-size", "4096",
             "--n-predict", "-1",
         ]
+        # MoE expert placement. Failure here must not stop the engine: the
+        # worst case is the same command line this function used to build.
+        try:
+            moe_args, moe_reason = _llama_moe_offload_plan(model_path)
+        except Exception as exc:
+            moe_args, moe_reason = [], "detection failed (%s); launch flags unchanged" % exc
+        if moe_args:
+            cmd.extend(moe_args)
+        _log_event(
+            logging.INFO,
+            "llama.cpp MoE offload: %s | flags: %s" % (
+                moe_reason, " ".join(moe_args) if moe_args else "(none)"),
+            always=True,
+        )
         # Tool calling needs --jinja plus a template that actually produces
         # tool calls llama-server can parse. Which template that is depends on
         # the model (see _model_template_handles_tools): one that already asks
@@ -2137,8 +2707,11 @@ def configure_logging():
     listener.start()
     return logger, listener
 
-def _log_event(level, message, request_context=None, exc_info=False):
-    if not _is_log_enabled(level):
+def _log_event(level, message, request_context=None, exc_info=False, always=False):
+    # `always` records startup decisions (MoE offload flags) even in errors-only
+    # mode. That mode otherwise drops INFO, and the chosen flags are the first
+    # thing to check when a large model is slow or fails to load.
+    if not always and not _is_log_enabled(level):
         return
     request_context = request_context or {}
     LOGGER.log(
@@ -2472,6 +3045,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 settings = _load_settings_file()
                 settings.update(incoming)
                 settings["logMode"] = _normalize_log_mode(settings.get("logMode"))
+                _normalize_moe_settings(settings)
                 _persist_settings_file(settings)
             _set_active_log_mode(settings["logMode"])
             _log_event(logging.INFO, "Settings saved successfully", request_context=request_context)
