@@ -2456,6 +2456,24 @@
             <span class="sys-hint" id="engine-switch-status" style="align-self:center;"></span>
           </div>
         </div>
+        <div class="sys-row" id="moe-offload-row">
+          <label for="moe-offload-mode">MoE expert offload (llama.cpp)</label>
+          <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;">
+            <select id="moe-offload-mode" class="sys-select">
+              <option value="auto">Auto (default)</option>
+              <option value="off">Off</option>
+              <option value="manual">Manual</option>
+            </select>
+            <span id="moe-offload-n-wrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;">
+              <input type="range" id="moe-offload-n" min="0" max="256" step="1" value="28" style="width:160px;" />
+              <input type="number" id="moe-offload-n-num" min="0" max="256" step="1" value="28" class="sys-select" style="min-width:0;width:76px;padding:6px 8px;" />
+              <span class="sys-hint">layers of experts kept in system RAM</span>
+            </span>
+          </div>
+          <span class="sys-hint">
+            For MoE models such as gpt-oss and Qwen3 A3B. Auto, on a discrete GPU, lets llama-server keep attention and the KV cache in VRAM and park expert weights that do not fit in system RAM. Off leaves experts on the GPU. Manual keeps the first N layers of experts in RAM. Dense models, CPU-only hosts, integrated GPUs, and Apple Metal stay on today's launch. Re-apply the llama.cpp engine after changing this, the same as tool calling.
+          </span>
+        </div>
         <div class="sys-row">
           <label>Download Ollama Model</label>
           <div class="sys-subrow" style="flex-wrap:wrap;gap:6px;align-items:flex-start;">
@@ -2847,6 +2865,8 @@
       model: localStorage.getItem('g-model') || '',
       globalSys: '',
       logMode: localStorage.getItem('logMode') || 'errors_only',
+      moeOffload: 'auto',
+      moeOffloadLayers: 28,
       mode: 'chat', // 'chat' or 'image'
 
       // Text to speech. ttsEnabled is discovered from the server (binary +
@@ -2990,6 +3010,45 @@
           'hw-pct' + (pct >= 90 ? ' danger' : pct >= 70 ? ' warn' : '');
       }
 
+    function syncMoeOffloadUI() {
+      const mode = document.getElementById('moe-offload-mode');
+      const wrap = document.getElementById('moe-offload-n-wrap');
+      const range = document.getElementById('moe-offload-n');
+      const num = document.getElementById('moe-offload-n-num');
+      const selected = S.moeOffload === 'off' || S.moeOffload === 'manual' ? S.moeOffload : 'auto';
+      if (mode) mode.value = selected;
+      if (wrap) wrap.style.display = selected === 'manual' ? 'inline-flex' : 'none';
+      const n = Number.isFinite(+S.moeOffloadLayers) ? S.moeOffloadLayers : 28;
+      if (range) range.value = String(n);
+      if (num) num.value = String(n);
+    }
+    async function saveMoeOffload() {
+      const modeEl = document.getElementById('moe-offload-mode');
+      const num = document.getElementById('moe-offload-n-num');
+      const range = document.getElementById('moe-offload-n');
+      S.moeOffload = modeEl && (modeEl.value === 'off' || modeEl.value === 'manual') ? modeEl.value : 'auto';
+      let n = parseInt(num && num.value, 10);
+      if (!Number.isFinite(n)) n = parseInt(range && range.value, 10);
+      if (!Number.isFinite(n) || n < 0) n = 0;
+      if (n > 256) n = 256;
+      S.moeOffloadLayers = n;
+      syncMoeOffloadUI();
+      try {
+        const r = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            llamaMoeOffload: S.moeOffload,
+            llamaMoeOffloadLayers: S.moeOffloadLayers,
+          }),
+        });
+        if (!r.ok) throw new Error('save failed');
+        toast('MoE offload saved. Re-apply the llama.cpp engine to use it.');
+      } catch {
+        toast('Could not save that setting.');
+      }
+    }
+
     // Global Prompt
     async function loadGlobalPrompt() {
       if (IS_SERVED) {
@@ -3002,6 +3061,10 @@
             S.toolsEnabled = !!s.toolsEnabled;
             const tb = document.getElementById('tools-enabled');
             if (tb) tb.checked = S.toolsEnabled;
+            S.moeOffload = s.llamaMoeOffload === 'off' || s.llamaMoeOffload === 'manual' ? s.llamaMoeOffload : 'auto';
+            const moeN = parseInt(s.llamaMoeOffloadLayers, 10);
+            S.moeOffloadLayers = Number.isFinite(moeN) ? Math.max(0, Math.min(256, moeN)) : 28;
+            syncMoeOffloadUI();
           }
         } catch { }
       } else {
@@ -5161,6 +5224,23 @@
       // Tool calling. Persisted server-side (unlike the per-device voice
       // prefs) because llama-server has to be started with a tool-capable
       // template for it to work at all.
+      const moeMode = document.getElementById('moe-offload-mode');
+      const moeRange = document.getElementById('moe-offload-n');
+      const moeNum = document.getElementById('moe-offload-n-num');
+      if (moeMode) moeMode.addEventListener('change', saveMoeOffload);
+      if (moeRange) {
+        moeRange.addEventListener('input', () => {
+          if (moeNum) moeNum.value = moeRange.value;
+        });
+        moeRange.addEventListener('change', saveMoeOffload);
+      }
+      if (moeNum) {
+        moeNum.addEventListener('input', () => {
+          if (moeRange && moeNum.value !== '') moeRange.value = moeNum.value;
+        });
+        moeNum.addEventListener('change', saveMoeOffload);
+      }
+
       const toolsBox = document.getElementById('tools-enabled');
       if (toolsBox) {
         toolsBox.addEventListener('change', async () => {

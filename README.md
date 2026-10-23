@@ -119,6 +119,23 @@ best GPU build for your hardware (CUDA / ROCm / Vulkan / CPU).
   models have no "system" slot in their chat template, so your system prompt is folded
   into your first message instead; Llama 2/3 and Mistral-Instruct get an explicit
   chat-template flag so token formatting doesn't drift.
+- **MoE expert offload (llama.cpp).** Mixture-of-experts GGUFs (gpt-oss, Qwen3 30B/35B-A3B,
+  Mixtral, anything whose metadata has `expert_count` greater than 1) can keep expert
+  weights in system RAM while attention, shared weights, and the KV cache stay on a
+  discrete GPU. The setting is in the settings panel and in `settings.json`
+  (`llamaMoeOffload`: `auto` / `off` / `manual`, plus `llamaMoeOffloadLayers`). It is
+  applied the next time the llama.cpp engine starts — re-apply the engine after changing
+  it, the same as tool calling. The chosen flags are written to `Shared/logs/chat_server.log`.
+  - **Auto** (the default) passes `--fit on` only when the GGUF is MoE *and* llama-server
+    sees a discrete GPU. In the bundled build (b9444) `--fit` measures free VRAM and
+    spills just the expert tensors that do not fit. `-ngl` and `--n-cpu-moe` are left
+    unset on purpose: setting either one disables that fitter. Dense models, CPU-only
+    hosts, integrated GPUs, Apple Metal, and the Android Termux launcher get no extra
+    flags, so their launch stays as it was.
+  - **Off** passes `--fit off` on that same discrete-GPU MoE case, so experts stay on
+    the GPU with the rest of the model.
+  - **Manual** passes `--gpu-layers 999` and `--n-cpu-moe N` (or `--cpu-moe` when N
+    covers every layer): every layer on the GPU, the first N layers of experts in RAM.
 
 ---
 
@@ -330,6 +347,7 @@ terminal window additionally shows a live color-coded one-line summary per reque
 | Script closes instantly (Windows) | Windows App Execution Aliases conflict. Run via cmd or as Admin. |
 | "Engine Not Found" | Run the install script before the start script. |
 | Slow generation | Model too large for your RAM. Use the Gemma 2 2B model. |
+| Large MoE model crawls or will not load on llama.cpp | Set **MoE expert offload** to Auto (or Manual with a layer count) and re-apply the llama.cpp engine. Auto uses `--fit` so a discrete GPU keeps attention and the KV cache while expert weights spill to system RAM. The flags actually passed are in `Shared/logs/chat_server.log`. Off forces experts onto the GPU and can fail to load when the file is bigger than VRAM. |
 | Chat error with llama.cpp | Ensure a `.gguf` file is selected in the settings panel before chatting. |
 | llama.cpp returns 400 | Usually a model mismatch, or two consecutive messages from the same role confusing the template. Re-select the model in settings and click Apply. |
 | llama.cpp option reverts to Ollama | The engine takes up to ~2 minutes to load on CPU-only machines — a progress bar tracks it. Wait for it; the selection is saved immediately and will survive a restart. |
